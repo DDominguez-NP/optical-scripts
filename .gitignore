@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# OpticStudio lens, session and bookend output files
+*.zmx
+*.ZMX
+*.zos
+*.ZOS
+*.zda
+*.ZDA
+*_report.txt
