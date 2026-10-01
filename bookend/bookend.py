@@ -2,7 +2,13 @@
 """
 bookend - paired coordinate-break "bookends" for OpticStudio sequential lenses.
 
-For every refractive component in a sequential OpticStudio file, bookend:
+bookend first redefines the fields: it finds the largest field in the file
+(radial distance from the axis) and replaces all fields with four points on
+the +Y axis at 0%, 50%, 70% and 100% of it, each with weight 1 and no
+vignetting factors.  The field type (angle, object height, ...) is kept.
+Use --keep-fields to leave the fields alone.
+
+Then, for every refractive component, bookend:
 
   1. fixes the clear semi-diameter of every lens surface at its current value;
   2. converts every Standard / Even Asphere lens surface to Zernike Standard Sag
@@ -81,7 +87,12 @@ RANGE_THICKNESS_OPERANDS = {"TTHI", "TTGT", "TTLT", "TTVA", "MNCT", "MXCT", "MNC
                             "MXCA", "MNCG", "MXCG", "MNET", "MXET", "MNEA", "MXEA",
                             "MNEG", "MXEG"}
 
-ASPHERE_HEADER_RE = re.compile(r"\d+\s*(st|nd|rd|th)\s*order|r\s*\^\s*\d+", re.I)
+# New field points, as fractions of the largest field, all on the +Y axis.
+FIELD_FRACTIONS = (0.0, 0.5, 0.7, 1.0)
+# Multi-configuration operands that override field definitions per configuration.
+MCE_FIELD_OPERANDS = {"XFIE", "YFIE", "FLWT", "FVDX", "FVDY", "FVCX", "FVCY", "FVAN", "FLTP"}
+
+ASPHERE_HEADER_RE =re.compile(r"\d+\s*(st|nd|rd|th)\s*order|r\s*\^\s*\d+", re.I)
 ZERNIKE_COEFF_RE = re.compile(r"^zernike\s*(\d+)", re.I)
 
 # Test rays for the before/after comparison: normalized field and pupil points.
@@ -330,6 +341,59 @@ class Bookend:
                 model_glass="Model" in solve_name(row.MaterialCell),
             ))
         return records
+
+    # ---- fields ------------------------------------------------------------
+
+    def field_units(self):
+        fields = self.system.SystemData.Fields
+        if "Angle" in str(fields.GetFieldType()):
+            return "deg"
+        return str(self.system.SystemData.Units.LensUnits).lower()
+
+    def current_fields(self):
+        fields = self.system.SystemData.Fields
+        out = []
+        for i in range(1, fields.NumberOfFields + 1):
+            f = fields.GetField(i)
+            vig = any(abs(float(getattr(f, v))) > 0 for v in ("VDX", "VDY", "VCX", "VCY", "VAN"))
+            out.append((float(f.X), float(f.Y), float(f.Weight), vig))
+        return out
+
+    def largest_field(self):
+        """(radial size, field number) of the largest field."""
+        best, number = 0.0, None
+        for i, (x, y, _, _) in enumerate(self.current_fields(), 1):
+            r = math.hypot(x, y)
+            if r > best:
+                best, number = r, i
+        return best, number
+
+    def redefine_fields(self, fmax):
+        """Replace all fields with FIELD_FRACTIONS of fmax on +Y, weight 1, no vignetting."""
+        fields = self.system.SystemData.Fields
+        while fields.NumberOfFields > 1:
+            fields.RemoveField(fields.NumberOfFields)
+        first = fields.GetField(1)
+        first.SetXFixed()
+        first.SetYFixed()
+        first.X, first.Y, first.Weight = 0.0, FIELD_FRACTIONS[0] * fmax, 1.0
+        for frac in FIELD_FRACTIONS[1:]:
+            fields.AddField(0.0, frac * fmax, 1.0)
+        fields.ClearVignetting()
+        for i in range(1, fields.NumberOfFields + 1):
+            f = fields.GetField(i)
+            f.VDX = f.VDY = f.VCX = f.VCY = f.VAN = 0.0
+            f.Ignore = False
+
+        mce = self.system.MCE
+        ops = sorted({str(mce.GetOperandAt(i).Type) for i in range(1, mce.NumberOfOperands + 1)}
+                     & MCE_FIELD_OPERANDS)
+        if ops:
+            self.report.flag("The Multi-Configuration Editor has field operands (" + ", ".join(ops) +
+                             ") that override the new fields in each configuration; please review them.")
+        if self.system.MFE.NumberOfOperands > 0:
+            self.report.flag("The merit function was built for the old fields. If it is a default "
+                             "merit function, regenerate it so it uses the new fields.")
 
     # ---- cell helpers ----------------------------------------------------
 
@@ -749,10 +813,32 @@ def run(args):
         report.info(f"bookend: {src}")
         report.info("")
         print_plan(report, records, units, notes)
+
+        fmax = None
+        if not args.keep_fields:
+            fmax, number = bk.largest_field()
+            units_label = bk.field_units()
+            report.info("")
+            report.info(f"Fields ({str(zos.system.SystemData.Fields.GetFieldType())}, {units_label}):")
+            old = bk.current_fields()
+            report.info("  current: " + ", ".join(f"({x:.6g}, {y:.6g}) w{w:g}" for x, y, w, _ in old))
+            if fmax <= 0:
+                report.flag("The largest field is 0 (on-axis only); fields left unchanged.")
+                fmax = None
+            else:
+                report.info(f"  largest: {fmax:.6g} {units_label} (field {number})")
+                report.info("  new:     " + ", ".join(f"(0, {f * fmax:.6g})" for f in FIELD_FRACTIONS)
+                            + ", all weight 1, no vignetting factors")
+                if any(vig for *_, vig in old):
+                    report.info("  (existing vignetting factors will be cleared)")
+
         if args.dry_run or not units:
             if not units:
                 report.info("No refractive components found; nothing to do.")
             return 0
+
+        if fmax is not None:
+            bk.redefine_fields(fmax)
 
         lens_surfaces = [s for u in units for s in u.surfaces]
         identity = {i: i for i in range(len(records))}
@@ -812,7 +898,9 @@ def main(argv=None):
     parser.add_argument("input", help="OpticStudio sequential file (.zos or .zmx)")
     parser.add_argument("-o", "--output", help="output file (default: <input>_bookend.<ext>)")
     parser.add_argument("--dry-run", action="store_true", help="print the plan without changing anything")
-    parser.add_argument("--max-term", type=int, default=11, help="Zernike Standard Sag maximum term (default 11)")
+    parser.add_argument("--keep-fields", action="store_true",
+                        help="leave the field definitions unchanged")
+    parser.add_argument("--max-term",type=int, default=11, help="Zernike Standard Sag maximum term (default 11)")
     parser.add_argument("--contact-tol", type=float, default=1e-9,
                         help="air gap treated as contact, in lens units (default 1e-9)")
     parser.add_argument("--tol", type=float, default=1e-8, help="relative tolerance for verification (default 1e-8)")
