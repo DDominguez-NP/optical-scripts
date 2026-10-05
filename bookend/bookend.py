@@ -2,7 +2,12 @@
 """
 bookend - paired coordinate-break "bookends" for OpticStudio sequential lenses.
 
-bookend first redefines the fields: it finds the largest field in the file
+bookend first fixes the clear semi-diameter of every lens surface at its
+largest value over all configurations, computed with the original fields.
+POP treats fixed semi-diameters as apertures, so fixing them in one
+configuration only, or after the fields change, clips the beam.
+
+It then redefines the fields: it finds the largest field in the file
 (radial distance from the axis) and replaces all fields with four points on
 the +Y axis at 0%, 50%, 70% and 100% of it, each with weight 1 and no
 vignetting factors.  The field type (angle, object height, ...) is kept.
@@ -10,7 +15,7 @@ Use --keep-fields to leave the fields alone.
 
 Then, for every refractive component, bookend:
 
-  1. fixes the clear semi-diameter of every lens surface at its current value;
+  1. (semi-diameters already fixed, see above);
   2. converts every Standard / Even Asphere lens surface to Zernike Standard Sag
      (maximum term 11, normalization radius = the fixed semi-diameter, all
      Zernike coefficients zero, so the sag is unchanged);
@@ -452,11 +457,29 @@ class Bookend:
 
     # ---- phase A: semi-diameter + Zernike --------------------------------
 
+    def fix_semi_diameters(self, surfaces):
+        """Fix each surface's semi-diameter at its largest value over all configurations.
+
+        Must run before the fields change: automatic semi-diameters depend on
+        the fields and vignetting factors.
+        """
+        mce = self.system.MCE
+        current = mce.CurrentConfiguration
+        largest = {s: 0.0 for s in surfaces}
+        for config in range(1, mce.NumberOfConfigurations + 1):
+            mce.SetCurrentConfiguration(config)
+            for s in surfaces:
+                largest[s] = max(largest[s], float(self.lde.GetSurfaceAt(s).SemiDiameter))
+        mce.SetCurrentConfiguration(current)
+        for s, value in largest.items():
+            row = self.lde.GetSurfaceAt(s)
+            self.make_fixed(row.SemiDiameterCell)
+            row.SemiDiameter = value
+        return largest
+
     def prepare_surface(self, idx, label):
         row = self.lde.GetSurfaceAt(idx)
         sd = float(row.SemiDiameter)
-        self.make_fixed(row.SemiDiameterCell)
-        row.SemiDiameter = sd
 
         type_name = str(row.Type)
         if type_name == ZERNIKE_TYPE:
@@ -837,16 +860,21 @@ def run(args):
                 report.info("No refractive components found; nothing to do.")
             return 0
 
+        lens_surfaces = [s for u in units for s in u.surfaces]
+        report.info("")
+        report.info(f"Fixing semi-diameters (largest over {zos.system.MCE.NumberOfConfigurations} configuration(s)):")
+        for s, value in bk.fix_semi_diameters(lens_surfaces).items():
+            report.info(f"  Surface {s}: {value:.6g}")
+
         if fmax is not None:
             bk.redefine_fields(fmax)
 
-        lens_surfaces = [s for u in units for s in u.surfaces]
         identity = {i: i for i in range(len(records))}
         sag_points = bk.sag_points(lens_surfaces)
         baseline = bk.snapshot(identity, sag_points)
 
         report.info("")
-        report.info("Fixing semi-diameters and converting surfaces:")
+        report.info("Converting surfaces:")
         for u in units:
             for k, s in enumerate(u.surfaces, 1):
                 bk.prepare_surface(s, f"Surface {s} ({u.uid}.s{k})")
