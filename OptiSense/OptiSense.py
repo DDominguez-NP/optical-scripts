@@ -2,7 +2,7 @@
 #
 # Given a lens file (.zmx) and a merit function (.mf), this script:
 #   1. Loads the lens and merit function in OpticStudio and records the nominal operand values.
-#   2. Writes a tolerance script (QuickTolScript.TSC) that reports every merit function operand
+#   2. Writes a tolerance script (OptiSenseScript.tsc) that reports every merit function operand
 #      as a separate tolerancing criterion.
 #   3. Runs a sensitivity tolerance analysis using that script and saves the results to a .ZTD file.
 #   4. Reads the .ZTD file, computes the change in each operand for every tolerance operand, and
@@ -17,6 +17,7 @@ import sys
 import time
 import math
 import configparser
+import traceback
 import pandas as pd
 import numpy as np
 
@@ -25,6 +26,12 @@ from PythonStandaloneApplication import PythonStandaloneApplication
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LABEL_COLUMNS = ['Operand', 'Comment', 'Min Tol', 'Max Tol']
+PROGRESS_INTERVAL_S = 3
+ESTIMATE_STEP_MIN = 15
+
+# Tolerance Data Editor rows that don't perturb the lens, so they add no merit function evaluations
+COMPENSATOR_TYPES = {'COMP', 'CPAR', 'CMCO', 'CEDV'}
+NON_TOLERANCE_TYPES = COMPENSATOR_TYPES | {'NULL', 'TOFF', 'COMM', 'SAVE', 'SEED', 'STAT', 'TWAV'}
 
 
 def load_configuration(config_file=os.path.join(SCRIPT_DIR, "config.ini")):
@@ -74,11 +81,10 @@ def load_merit_function(system, zosapi, mf_file):
     label for each operand (type followed by its first four parameters), taken directly
     from the Merit Function Editor so labels and values always line up.
     """
-    if not os.path.exists(mf_file):
-        raise FileNotFoundError(f"Merit function file not found: {mf_file}")
-
     system.MFE.LoadMeritFunction(mf_file)
+    eval_start = time.perf_counter()
     system.MFE.CalculateMeritFunction()
+    eval_seconds = time.perf_counter() - eval_start
 
     columns = zosapi.Editors.MFE.MeritColumn
     param_columns = [columns.Param1, columns.Param2, columns.Param3, columns.Param4]
@@ -97,23 +103,55 @@ def load_merit_function(system, zosapi, mf_file):
         else:
             nom_mf_results.append(float(val))
 
-    return nom_mf_results, operand_labels
+    return nom_mf_results, operand_labels, eval_seconds
 
 
-def create_tol_script(mf_file, operand_labels, inject_commands, xtra_script_path):
+def _format_duration(seconds):
+    """
+    Formats a duration in seconds as m:ss, or h:mm:ss for an hour or more.
+    """
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def estimate_tolerance_time(system, eval_seconds, inject_commands):
+    """
+    Prints a rough upfront estimate of the sensitivity run time, rounded up to the next
+    ESTIMATE_STEP_MIN minutes, as a sanity check for the engineer. Without compensators,
+    each tolerance is evaluated at its minimum and maximum, plus one nominal evaluation.
+    """
+    tde_types = [str(system.TDE.GetOperandAt(k).Type) for k in range(1, system.TDE.NumberOfOperands + 1)]
+    num_tolerances = sum(1 for t in tde_types if t not in NON_TOLERANCE_TYPES)
+
+    if any(t in COMPENSATOR_TYPES for t in tde_types):
+        print(f"[*] {num_tolerances} tolerances with compensators: run time can't be estimated upfront.")
+        return
+
+    estimate_min = (1 + 2 * num_tolerances) * eval_seconds / 60
+    step = ESTIMATE_STEP_MIN
+    print(f"[*] {num_tolerances} tolerances: expected to take less than {math.ceil(estimate_min / step) * step} minutes.")
+    if inject_commands:
+        print("[*] Note: additional script commands (e.g. compensation) can make the run take longer.")
+
+
+def create_tol_script(zemax_data_dir, mf_file, operand_labels, inject_commands, xtra_script_path):
     """
     Writes a Zemax Tolerance Script (*.TSC) that reports each merit function operand
-    as its own criterion. Returns the script path and the CSV header names.
+    as its own criterion. The script goes in the Tolerance folder of OpticStudio's
+    current data folder, which is where the Tolerancing tool looks for it.
+    Returns the script path and the CSV header names.
     """
-    documents_path = os.path.join(os.path.expanduser("~"), "Documents")
-    zemax_tol_folder = os.path.join(documents_path, "Zemax", "Tolerance")
-    quick_tol_script = os.path.join(zemax_tol_folder, 'QuickTolScript.TSC')
+    zemax_tol_folder = os.path.join(zemax_data_dir, "Tolerance")
+    quick_tol_script = os.path.join(zemax_tol_folder, 'OptiSenseScript.tsc')
     header_names = LABEL_COLUMNS + operand_labels
 
     with open(quick_tol_script, "w") as file:
-        if inject_commands and os.path.exists(xtra_script_path):
+        if inject_commands:
             with open(xtra_script_path, 'r', encoding='utf-8') as sfile:
-                file.writelines(sfile.readlines())
+                extra_commands = sfile.read()
+            # Ensure the next command starts on its own line even if the file lacks a final newline
+            file.write(extra_commands if extra_commands.endswith('\n') else extra_commands + '\n')
 
         file.write("! Evaluate system with given merit function.\n")
         file.write(f"LOADMERIT \"{mf_file}\"\n")
@@ -133,30 +171,49 @@ def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filenam
     Configures and executes the tolerance analysis using the generated script.
     """
     tol = system.Tools.OpenTolerancing()
-    tol.SetupMode = zosapi.Tools.Tolerancing.SetupModes.Sensitivity
-    tol.Criterion = zosapi.Tools.Tolerancing.Criterions.UserScript
-    tol.SaveTolDataFile = True
-    tol.TolDataFile = ztd_filename
-    tol.OutputFile = txt_filename
-    tol.NumberOfRuns = 0
-    tol.NumberToSave = 0
+    if tol is None:
+        raise RuntimeError("Could not open the Tolerancing tool. Is another analysis tool already open?")
 
-    # Search for tolerance script and assign it
-    tol_idx = None
-    script_basename = os.path.basename(tol_script).lower()
-    for i in range(tol.NumberOfCriterionScripts):
-        if script_basename == tol.GetCriterionScriptAt(i).lower():
-            tol_idx = i
-            break
+    try:
+        tol.SetupMode = zosapi.Tools.Tolerancing.SetupModes.Sensitivity
+        tol.Criterion = zosapi.Tools.Tolerancing.Criterions.UserScript
+        tol.SaveTolDataFile = True
+        tol.TolDataFile = ztd_filename
+        tol.OutputFile = txt_filename
+        tol.NumberOfRuns = 0
+        tol.NumberToSave = 0
 
-    if tol_idx is None:
-        raise ValueError(f"Could not find tolerance script '{script_basename}' in Zemax.")
+        # Search for tolerance script and assign it
+        tol_idx = None
+        script_basename = os.path.basename(tol_script).lower()
+        for i in range(tol.NumberOfCriterionScripts):
+            if script_basename == tol.GetCriterionScriptAt(i).lower():
+                tol_idx = i
+                break
 
-    tol.CriterionScript = tol_idx
+        if tol_idx is None:
+            raise ValueError(f"Could not find tolerance script '{script_basename}' in Zemax.")
 
-    print("[*] Tolerance analysis in progress. This may take a while...")
-    tol.RunAndWaitForCompletion()
-    tol.Close()
+        tol.CriterionScript = tol_idx
+
+        # Run in the background and show elapsed time; the sleep keeps polling overhead negligible
+        print("[*] Tolerance analysis running. Press Ctrl+C to cancel.")
+        start = time.perf_counter()
+        tol.Run()
+        try:
+            while tol.IsRunning:
+                time.sleep(PROGRESS_INTERVAL_S)
+                print(f"\r[*] Elapsed: {_format_duration(time.perf_counter() - start)}", end="", flush=True)
+        except KeyboardInterrupt:
+            tol.Cancel()
+            raise
+        tol.WaitForCompletion()
+        print(f"\n[*] Tolerance analysis finished in {_format_duration(time.perf_counter() - start)}")
+
+        if not tol.Succeeded:
+            raise RuntimeError(f"Tolerance analysis did not complete: {tol.ErrorMessage}")
+    finally:
+        tol.Close()
 
 
 def process_and_export_results(system, ztd_filepath, nom_mf_results, header_names, output_csv_path):
@@ -164,8 +221,15 @@ def process_and_export_results(system, ztd_filepath, nom_mf_results, header_name
     Opens the ZTD file, extracts sensitivity data, computes Zeiss math, and exports to CSV.
     """
     tol_data_viewer = system.Tools.OpenToleranceDataViewer()
+    if tol_data_viewer is None:
+        raise RuntimeError("Could not open the Tolerance Data Viewer. Is another analysis tool already open?")
+
     tol_data_viewer.FileName = ztd_filepath
     tol_data_viewer.RunAndWaitForCompletion()
+    if not tol_data_viewer.Succeeded:
+        error_message = tol_data_viewer.ErrorMessage
+        tol_data_viewer.Close()
+        raise RuntimeError(f"Could not read tolerance data file {ztd_filepath}: {error_message}")
     sdata = tol_data_viewer.SensitivityData
 
     # Criterion 0 is skipped; criteria 1..N correspond to the REPORT_NB lines (MFE operands 1..N)
@@ -220,59 +284,81 @@ def main():
     inject_commands = config.getboolean('SETTINGS', 'InjectAdditionalCommands', fallback=False)
     xtra_script_file = os.path.normpath(config.get('SETTINGS', 'AdditionalCommandsFile'))
 
-    # Validate core file paths before launching Zemax
-    if not os.path.exists(zemax_file):
-        print(f"[Error] Zemax file not found: {zemax_file}")
-        return
+    # Validate input files before launching Zemax
+    required_files = [('Zemax file', zemax_file), ('Merit function file', mf_file)]
+    if inject_commands:
+        required_files.append(('Additional commands file', xtra_script_file))
+    missing = [f"{name} not found: {path}" for name, path in required_files if not os.path.exists(path)]
+    if missing:
+        for message in missing:
+            print(f"[Error] {message}")
+        return 1
 
     os.makedirs(output_dir, exist_ok=True)
     filename_prefix = os.path.splitext(os.path.basename(zemax_file))[0]
 
+    ztd_filename = f"{filename_prefix}_ZTDFile.ZTD"
+    txt_filename = f"{filename_prefix}_TolSummary.TXT"
+    ztd_filepath = os.path.join(os.path.dirname(zemax_file), ztd_filename)
+    txt_filepath = os.path.join(os.path.dirname(zemax_file), txt_filename)
+    output_csv_path = os.path.join(output_dir, f"{filename_prefix}_TolResults.csv")
+
+    exit_code = 0
     zos = None
     try:
+        # Remove results from any previous run so stale data can never be read back in
+        for old_file in (ztd_filepath, txt_filepath, output_csv_path):
+            if os.path.exists(old_file):
+                os.remove(old_file)
+
         # 2. Initialize Zemax
         print("[*] Connecting to Zemax OpticStudio...")
         zos = PythonStandaloneApplication()
         zosapi = zos.ZOSAPI
         system = zos.TheSystem
-        system.LoadFile(zemax_file, False)
+        if not system.LoadFile(zemax_file, False):
+            raise RuntimeError(f"OpticStudio could not load the lens file: {zemax_file}")
 
         # 3. Load Merit Function and record nominal values
         print("[*] Calculating Nominal Merit Function...")
-        nom_mf_results, operand_labels = load_merit_function(system, zosapi, mf_file)
+        nom_mf_results, operand_labels, eval_seconds = load_merit_function(system, zosapi, mf_file)
+        estimate_tolerance_time(system, eval_seconds, inject_commands)
 
         # 4. Create Tolerance Script
         print("[*] Generating Tolerance Script...")
         quick_tol_script, header_names = create_tol_script(
-            mf_file, operand_labels, inject_commands, xtra_script_file
+            str(zos.TheApplication.ZemaxDataDir), mf_file, operand_labels, inject_commands, xtra_script_file
         )
 
         # 5. Run Tolerance Analysis
-        ztd_filename = f"{filename_prefix}_ZTDFile.ZTD"
-        txt_filename = f"{filename_prefix}_TolSummary.TXT"
         run_tolerance_analysis(system, zosapi, quick_tol_script, ztd_filename, txt_filename)
 
         # 6. Process and Export Results
         print("[*] Processing Tolerance Data Viewer results...")
-        ztd_filepath = os.path.join(os.path.dirname(zemax_file), ztd_filename)
-        output_csv_path = os.path.join(output_dir, f"{filename_prefix}_TolResults.csv")
-
         process_and_export_results(
             system, ztd_filepath, nom_mf_results, header_names, output_csv_path
         )
 
-    except Exception as e:
-        print(f"\n[Fatal Error] An unexpected error occurred: {e}")
+    except Exception:
+        print("\n[Fatal Error] The analysis did not complete. No results were written.")
+        traceback.print_exc()
+        exit_code = 1
 
     finally:
         # 7. Safe Cleanup
-        if zos is not None:
-            del zos
-            print("[*] Zemax connection successfully closed.")
+        if zos is not None and zos.TheApplication is not None:
+            try:
+                zos.TheApplication.CloseApplication()
+                zos.TheApplication = None
+                print("[*] Zemax connection successfully closed.")
+            except Exception as e:
+                print(f"[Warning] Could not close OpticStudio cleanly; check Task Manager for a leftover instance: {e}")
 
         elapsed_time = time.perf_counter() - start_time
         print(f"[*] Total script execution time: {elapsed_time / 60:.2f} minutes")
 
+    return exit_code
+
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

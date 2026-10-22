@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# IDE settings
+.idea/
+
+# Local file paths (OptiSense generates a template config.ini on first run)
+config.ini
