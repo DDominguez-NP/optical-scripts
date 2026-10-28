@@ -14,8 +14,9 @@
 
 import os
 import sys
-import time
+# import time
 import math
+import re
 import configparser
 import traceback
 import pandas as pd
@@ -26,8 +27,14 @@ from PythonStandaloneApplication import PythonStandaloneApplication
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LABEL_COLUMNS = ['Operand', 'Comment', 'Min Tol', 'Max Tol']
-PROGRESS_INTERVAL_S = 3
-ESTIMATE_STEP_MIN = 15
+CANCEL_CHECK_S = 1
+DEFAULT_CORES = 8
+
+# ZPLM macro values that mean the macro failed: 0 (macro error) and -1 (chief ray failed)
+MACRO_FAILURE_VALUES = (0.0, -1.0)
+FAILED_TEXT = 'FAILED'
+# PROGRESS_INTERVAL_S = 3
+# ESTIMATE_STEP_MIN = 15
 
 # Tolerance Data Editor rows that don't perturb the lens, so they add no merit function evaluations
 COMPENSATOR_TYPES = {'COMP', 'CPAR', 'CMCO', 'CEDV'}
@@ -49,7 +56,8 @@ def load_configuration(config_file=os.path.join(SCRIPT_DIR, "config.ini")):
         }
         config['SETTINGS'] = {
             'InjectAdditionalCommands': 'False',
-            'AdditionalCommandsFile': r'C:\Path\To\XtraScript.txt'
+            'AdditionalCommandsFile': r'C:\Path\To\XtraScript.txt',
+            'Cores': str(DEFAULT_CORES)
         }
         with open(config_file, 'w') as f:
             config.write(f)
@@ -82,9 +90,9 @@ def load_merit_function(system, zosapi, mf_file):
     from the Merit Function Editor so labels and values always line up.
     """
     system.MFE.LoadMeritFunction(mf_file)
-    eval_start = time.perf_counter()
+    # eval_start = time.perf_counter()
     system.MFE.CalculateMeritFunction()
-    eval_seconds = time.perf_counter() - eval_start
+    # eval_seconds = time.perf_counter() - eval_start
 
     columns = zosapi.Editors.MFE.MeritColumn
     param_columns = [columns.Param1, columns.Param2, columns.Param3, columns.Param4]
@@ -103,36 +111,38 @@ def load_merit_function(system, zosapi, mf_file):
         else:
             nom_mf_results.append(float(val))
 
-    return nom_mf_results, operand_labels, eval_seconds
+    # return nom_mf_results, operand_labels, eval_seconds
+    return nom_mf_results, operand_labels
 
 
-def _format_duration(seconds):
-    """
-    Formats a duration in seconds as m:ss, or h:mm:ss for an hour or more.
-    """
-    minutes, secs = divmod(int(round(seconds)), 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
-
-
-def estimate_tolerance_time(system, eval_seconds, inject_commands):
-    """
-    Prints a rough upfront estimate of the sensitivity run time, rounded up to the next
-    ESTIMATE_STEP_MIN minutes, as a sanity check for the engineer. Without compensators,
-    each tolerance is evaluated at its minimum and maximum, plus one nominal evaluation.
-    """
-    tde_types = [str(system.TDE.GetOperandAt(k).Type) for k in range(1, system.TDE.NumberOfOperands + 1)]
-    num_tolerances = sum(1 for t in tde_types if t not in NON_TOLERANCE_TYPES)
-
-    if any(t in COMPENSATOR_TYPES for t in tde_types):
-        print(f"[*] {num_tolerances} tolerances with compensators: run time can't be estimated upfront.")
-        return
-
-    estimate_min = (1 + 2 * num_tolerances) * eval_seconds / 60
-    step = ESTIMATE_STEP_MIN
-    print(f"[*] {num_tolerances} tolerances: expected to take less than {math.ceil(estimate_min / step) * step} minutes.")
-    if inject_commands:
-        print("[*] Note: additional script commands (e.g. compensation) can make the run take longer.")
+# Time reporting disabled.
+# def _format_duration(seconds):
+#     """
+#     Formats a duration in seconds as m:ss, or h:mm:ss for an hour or more.
+#     """
+#     minutes, secs = divmod(int(round(seconds)), 60)
+#     hours, minutes = divmod(minutes, 60)
+#     return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+#
+#
+# def estimate_tolerance_time(system, eval_seconds, inject_commands):
+#     """
+#     Prints a rough upfront estimate of the sensitivity run time, rounded up to the next
+#     ESTIMATE_STEP_MIN minutes, as a sanity check for the engineer. Without compensators,
+#     each tolerance is evaluated at its minimum and maximum, plus one nominal evaluation.
+#     """
+#     tde_types = [str(system.TDE.GetOperandAt(k).Type) for k in range(1, system.TDE.NumberOfOperands + 1)]
+#     num_tolerances = sum(1 for t in tde_types if t not in NON_TOLERANCE_TYPES)
+#
+#     if any(t in COMPENSATOR_TYPES for t in tde_types):
+#         print(f"[*] {num_tolerances} tolerances with compensators: run time can't be estimated upfront.")
+#         return
+#
+#     estimate_min = (1 + 2 * num_tolerances) * eval_seconds / 60
+#     step = ESTIMATE_STEP_MIN
+#     print(f"[*] {num_tolerances} tolerances: expected to take less than {math.ceil(estimate_min / step) * step} minutes.")
+#     if inject_commands:
+#         print("[*] Note: additional script commands (e.g. compensation) can make the run take longer.")
 
 
 def create_tol_script(zemax_data_dir, mf_file, operand_labels, inject_commands, xtra_script_path):
@@ -166,7 +176,25 @@ def create_tol_script(zemax_data_dir, mf_file, operand_labels, inject_commands, 
     return quick_tol_script, header_names
 
 
-def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filename):
+def _set_tolerancing_cores(tol, cores):
+    """
+    Limits the Tolerancing tool to the given number of CPU cores (None keeps OpticStudio's
+    setting). The choices are read from OpticStudio, matching on the number in each label.
+    """
+    if cores is None:
+        print(f"[*] Tolerancing cores: OpticStudio setting ({tol.SetupCore})")
+        return
+    choices = [str(tol.GetSetupCoreAt(i)) for i in range(tol.NumberOfSetupCores)]
+    numbers = [int(m.group()) if (m := re.search(r'\d+', c)) else None for c in choices]
+    if cores in numbers:
+        tol.SetupCoreIndex = numbers.index(cores)
+        print(f"[*] Tolerancing cores: {cores}")
+    else:
+        print(f"[Warning] {cores} cores is not one of OpticStudio's choices ({', '.join(choices)}); "
+              f"using its setting ({tol.SetupCore}).")
+
+
+def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filename, cores=None):
     """
     Configures and executes the tolerance analysis using the generated script.
     """
@@ -182,6 +210,7 @@ def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filenam
         tol.OutputFile = txt_filename
         tol.NumberOfRuns = 0
         tol.NumberToSave = 0
+        _set_tolerancing_cores(tol, cores)
 
         # Search for tolerance script and assign it
         tol_idx = None
@@ -196,24 +225,67 @@ def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filenam
 
         tol.CriterionScript = tol_idx
 
-        # Run in the background and show elapsed time; the sleep keeps polling overhead negligible
-        print("[*] Tolerance analysis running. Press Ctrl+C to cancel.")
-        start = time.perf_counter()
+        # Time reporting disabled; run with a single blocking call instead.
+        # # Run in the background and show elapsed time; the sleep keeps polling overhead negligible
+        # print("[*] Tolerance analysis running. Press Ctrl+C to cancel.")
+        # start = time.perf_counter()
+        # tol.Run()
+        # try:
+        #     while tol.IsRunning:
+        #         time.sleep(PROGRESS_INTERVAL_S)
+        #         print(f"\r[*] Elapsed: {_format_duration(time.perf_counter() - start)}", end="", flush=True)
+        # except KeyboardInterrupt:
+        #     tol.Cancel()
+        #     raise
+        # tol.WaitForCompletion()
+        # print(f"\n[*] Tolerance analysis finished in {_format_duration(time.perf_counter() - start)}")
+        # Run in the background so Ctrl+C can cancel: WaitWithTimeout returns about once a
+        # second, which gives Python a chance to act on the keypress
+        print("[*] Tolerance analysis in progress. This may take a while... (press Ctrl+C to cancel)")
         tol.Run()
         try:
             while tol.IsRunning:
-                time.sleep(PROGRESS_INTERVAL_S)
-                print(f"\r[*] Elapsed: {_format_duration(time.perf_counter() - start)}", end="", flush=True)
+                tol.WaitWithTimeout(CANCEL_CHECK_S)
         except KeyboardInterrupt:
+            print("\n[*] Cancelling the tolerance analysis...")
             tol.Cancel()
             raise
-        tol.WaitForCompletion()
-        print(f"\n[*] Tolerance analysis finished in {_format_duration(time.perf_counter() - start)}")
 
         if not tol.Succeeded:
             raise RuntimeError(f"Tolerance analysis did not complete: {tol.ErrorMessage}")
     finally:
         tol.Close()
+
+
+def _evaluation_failed(value, is_macro):
+    """
+    True if a criterion value signals a failed evaluation: non-finite for any operand, or
+    exactly 0 (macro error) or -1 (macro's chief-ray-failure code) for a ZPLM operand.
+    """
+    return not math.isfinite(value) or (is_macro and value in MACRO_FAILURE_VALUES)
+
+
+def _larger_change(effect, nominal, is_macro):
+    """
+    Returns the change from nominal at the tolerance's minimum or maximum, whichever is
+    larger in magnitude, keeping its sign. EstimatedChangeMinimum/Maximum hold the
+    criterion's value at each tolerance limit. Returns NaN if either evaluation failed.
+    """
+    value_min, value_max = effect.EstimatedChangeMinimum, effect.EstimatedChangeMaximum
+    if _evaluation_failed(value_min, is_macro) or _evaluation_failed(value_max, is_macro):
+        return math.nan
+    change_min = value_min - nominal
+    change_max = value_max - nominal
+    return change_min if abs(change_min) > abs(change_max) else change_max
+
+
+def _format_cell(value, failed_text=''):
+    """
+    Formats a CSV cell: floats in scientific notation, NaN as failed_text, anything else as-is.
+    """
+    if isinstance(value, float):
+        return failed_text if math.isnan(value) else f"{value:.6e}"
+    return value
 
 
 def process_and_export_results(system, ztd_filepath, nom_mf_results, header_names, output_csv_path):
@@ -241,39 +313,55 @@ def process_and_export_results(system, ztd_filepath, nom_mf_results, header_name
             f"but the merit function has {num_operands} operands."
         )
 
+    operand_labels = header_names[len(LABEL_COLUMNS):]
+    is_macro = [label.startswith('ZPLM') for label in operand_labels]
+
     tol_rows = []
     for m in range(sdata.NumberOfResultOperands):
         sd_op = sdata.GetOperand(m)
         effects = [
-            sd_op.GetEffectOnCriterion(j).EstimatedChangeMaximum - nom_mf_results[j - 1]
+            _larger_change(sd_op.GetEffectOnCriterion(j), nom_mf_results[j - 1], is_macro[j - 1])
             for j in range(1, num_operands + 1)
         ]
         tol_rows.append([str(sd_op.OperandType), str(sd_op.Comment), sd_op.Minimum, sd_op.Maximum] + effects)
 
     tol_data_viewer.Close()
 
-    # Summary Calculations: Abs sum, RSS, Raentsch sum (full precision; formatting happens at export)
+    # Summary Calculations: Abs sum, RSS, Raentsch sum, skipping failed evaluations (NaN)
     effects_array = np.array([row[len(LABEL_COLUMNS):] for row in tol_rows], dtype=float).reshape(-1, num_operands)
-    col_abs_sum = np.abs(effects_array).sum(axis=0)
-    col_rss = np.sqrt(np.square(effects_array).sum(axis=0))
+    failed = np.isnan(effects_array)
+    col_abs_sum = np.nansum(np.abs(effects_array), axis=0)
+    col_rss = np.sqrt(np.nansum(np.square(effects_array), axis=0))
     col_raentsch = np.sqrt(col_abs_sum * col_rss)
+    col_failed = failed.sum(axis=0)
+
+    for j in np.flatnonzero(col_failed):
+        rows = ", ".join(f"tolerance #{m + 1} ({tol_rows[m][0]})" for m in np.flatnonzero(failed[:, j]))
+        print(f"[Warning] Failed evaluations excluded from '{operand_labels[j]}' (column {len(LABEL_COLUMNS) + j + 1}): {rows}")
+    for j, label in enumerate(operand_labels):
+        if _evaluation_failed(nom_mf_results[j], is_macro[j]):
+            print(f"[Warning] Nominal value of '{label}' (column {len(LABEL_COLUMNS) + j + 1}) looks like a failed evaluation; check this column.")
 
     summary_rows = [
         ['', 'Nominal Values', '', ''] + list(nom_mf_results),
         ['', 'Sum of Absolute Values', '', ''] + col_abs_sum.tolist(),
         ['', 'Root Sum Square', '', ''] + col_rss.tolist(),
         ['', 'Raentsch Sum (Zeiss Approach)', '', ''] + col_raentsch.tolist(),
-        [''] * len(LABEL_COLUMNS) + [np.nan] * num_operands,  # blank separator row
+        ['', 'Failed Evaluations (excluded above)', '', ''] + [int(n) for n in col_failed],
+        [''] * len(header_names),  # blank separator row
     ]
+    n_labels = len(LABEL_COLUMNS)
+    formatted = ([row[:n_labels] + [_format_cell(v) for v in row[n_labels:]] for row in summary_rows]
+                 + [row[:n_labels] + [_format_cell(v, FAILED_TEXT) for v in row[n_labels:]] for row in tol_rows])
 
-    final_df = pd.DataFrame(summary_rows + tol_rows, columns=header_names)
-    final_df.to_csv(output_csv_path, sep=',', mode='w', index=False, header=True, float_format='%.6e')
+    final_df = pd.DataFrame(formatted, columns=header_names)
+    final_df.to_csv(output_csv_path, sep=',', mode='w', index=False, header=True)
 
     print(f"[*] Analysis complete! Results saved to: {output_csv_path}")
 
 
 def main():
-    start_time = time.perf_counter()
+    # start_time = time.perf_counter()
 
     # 1. Load Configuration
     config = load_configuration()
@@ -283,6 +371,13 @@ def main():
 
     inject_commands = config.getboolean('SETTINGS', 'InjectAdditionalCommands', fallback=False)
     xtra_script_file = os.path.normpath(config.get('SETTINGS', 'AdditionalCommandsFile'))
+
+    # Cores: a number limits tolerancing to that many CPU cores; blank keeps OpticStudio's setting
+    cores_text = config.get('SETTINGS', 'Cores', fallback=str(DEFAULT_CORES)).strip()
+    if cores_text and not cores_text.isdigit():
+        print(f"[Error] Cores in config.ini must be a whole number or blank, not '{cores_text}'")
+        return 1
+    cores = int(cores_text) if cores_text else None
 
     # Validate input files before launching Zemax
     required_files = [('Zemax file', zemax_file), ('Merit function file', mf_file)]
@@ -321,8 +416,9 @@ def main():
 
         # 3. Load Merit Function and record nominal values
         print("[*] Calculating Nominal Merit Function...")
-        nom_mf_results, operand_labels, eval_seconds = load_merit_function(system, zosapi, mf_file)
-        estimate_tolerance_time(system, eval_seconds, inject_commands)
+        # nom_mf_results, operand_labels, eval_seconds = load_merit_function(system, zosapi, mf_file)
+        # estimate_tolerance_time(system, eval_seconds, inject_commands)
+        nom_mf_results, operand_labels = load_merit_function(system, zosapi, mf_file)
 
         # 4. Create Tolerance Script
         print("[*] Generating Tolerance Script...")
@@ -331,13 +427,22 @@ def main():
         )
 
         # 5. Run Tolerance Analysis
-        run_tolerance_analysis(system, zosapi, quick_tol_script, ztd_filename, txt_filename)
+        # ZPLM macros share one POP beam file, so parallel evaluations collide and crash OpticStudio
+        if cores != 1 and any(label.startswith('ZPLM') for label in operand_labels):
+            print("[*] Merit function calls a ZPLM macro; running tolerancing on 1 core to avoid "
+                  "parallel evaluations sharing the macro's beam file.")
+            cores = 1
+        run_tolerance_analysis(system, zosapi, quick_tol_script, ztd_filename, txt_filename, cores)
 
         # 6. Process and Export Results
         print("[*] Processing Tolerance Data Viewer results...")
         process_and_export_results(
             system, ztd_filepath, nom_mf_results, header_names, output_csv_path
         )
+
+    except KeyboardInterrupt:
+        print("[*] Run cancelled. No results were written.")
+        exit_code = 1
 
     except Exception:
         print("\n[Fatal Error] The analysis did not complete. No results were written.")
@@ -354,8 +459,8 @@ def main():
             except Exception as e:
                 print(f"[Warning] Could not close OpticStudio cleanly; check Task Manager for a leftover instance: {e}")
 
-        elapsed_time = time.perf_counter() - start_time
-        print(f"[*] Total script execution time: {elapsed_time / 60:.2f} minutes")
+        # elapsed_time = time.perf_counter() - start_time
+        # print(f"[*] Total script execution time: {elapsed_time / 60:.2f} minutes")
 
     return exit_code
 
