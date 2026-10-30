@@ -10,6 +10,9 @@
 #      (Zeiss approach: sqrt(abs_sum * rss)).
 #   5. Exports the nominal values, summaries, and per-tolerance changes to a CSV file.
 #
+# If the merit function calls a ZPLM macro, OptiSense first writes the POP settings file that the
+# POP pixel-readout macro (ZPL21) reads: <lens name>_POPtext.CFG next to the lens file.
+#
 # File paths and options are read from config.ini, located next to this script.
 
 import os
@@ -33,6 +36,8 @@ DEFAULT_CORES = 8
 # ZPLM macro values that mean the macro failed: 0 (macro error) and -1 (chief ray failed)
 MACRO_FAILURE_VALUES = (0.0, -1.0)
 FAILED_TEXT = 'FAILED'
+# POP settings for the pixel-readout macro: the lens's POP settings with no beam file and no zoom
+POP_TEXT_SETTINGS_SUFFIX = '_POPtext.CFG'
 # PROGRESS_INTERVAL_S = 3
 # ESTIMATE_STEP_MIN = 15
 
@@ -57,7 +62,8 @@ def load_configuration(config_file=os.path.join(SCRIPT_DIR, "config.ini")):
         config['SETTINGS'] = {
             'InjectAdditionalCommands': 'False',
             'AdditionalCommandsFile': r'C:\Path\To\XtraScript.txt',
-            'Cores': str(DEFAULT_CORES)
+            'Cores': str(DEFAULT_CORES),
+            'ParallelMacros': 'False'
         }
         with open(config_file, 'w') as f:
             config.write(f)
@@ -113,6 +119,37 @@ def load_merit_function(system, zosapi, mf_file):
 
     # return nom_mf_results, operand_labels, eval_seconds
     return nom_mf_results, operand_labels
+
+
+def merit_function_calls_macros(mf_file):
+    """
+    True if the merit function file has a ZPLM row. Read from the file itself so it can be
+    checked before the merit function is evaluated (evaluating it already runs the macros).
+    """
+    with open(mf_file, 'rb') as f:
+        raw = f.read()
+    text = raw.decode('utf-16') if raw[:2] in (b'\xff\xfe', b'\xfe\xff') else raw.decode('utf-8', errors='replace')
+    return any(line.startswith('ZPLM') for line in text.splitlines())
+
+
+def write_pop_text_settings(system, zosapi, lens_file):
+    """
+    Writes the POP settings file the pixel-readout macro reads: the lens's own POP settings with
+    "Save Output Beam" off, so parallel evaluations never share a beam file, and no display zoom,
+    so the text listing holds POP's full native grid. Returns the settings file path.
+    """
+    settings_path = os.path.splitext(lens_file)[0] + POP_TEXT_SETTINGS_SUFFIX
+    # SettingsFirst opens the analysis without running POP, which would write the default beam file
+    pop = system.Analyses.New_Analysis_SettingsFirst(zosapi.Analysis.AnalysisIDM.PhysicalOpticsPropagation)
+    try:
+        settings = pop.GetSettings().__implementation__
+        settings.SaveOutputBeam = False
+        settings.ZoomIn = zosapi.Analysis.PhysicalOptics.POPZoomTypes.NoZoom
+        if not settings.SaveTo(settings_path):
+            raise RuntimeError(f"Could not write the POP settings file: {settings_path}")
+    finally:
+        pop.Close()
+    return settings_path
 
 
 # Time reporting disabled.
@@ -378,6 +415,8 @@ def main():
         print(f"[Error] Cores in config.ini must be a whole number or blank, not '{cores_text}'")
         return 1
     cores = int(cores_text) if cores_text else None
+    # Only safe with a macro that never shares a file between evaluations (ZPL21 as of 2026-10-30)
+    parallel_macros = config.getboolean('SETTINGS', 'ParallelMacros', fallback=False)
 
     # Validate input files before launching Zemax
     required_files = [('Zemax file', zemax_file), ('Merit function file', mf_file)]
@@ -414,6 +453,12 @@ def main():
         if not system.LoadFile(zemax_file, False):
             raise RuntimeError(f"OpticStudio could not load the lens file: {zemax_file}")
 
+        # The pixel-readout macro needs its POP settings file before the merit function is evaluated
+        calls_macros = merit_function_calls_macros(mf_file)
+        if calls_macros:
+            settings_path = write_pop_text_settings(system, zosapi, zemax_file)
+            print(f"[*] POP settings for the macro saved to {settings_path}")
+
         # 3. Load Merit Function and record nominal values
         print("[*] Calculating Nominal Merit Function...")
         # nom_mf_results, operand_labels, eval_seconds = load_merit_function(system, zosapi, mf_file)
@@ -427,10 +472,11 @@ def main():
         )
 
         # 5. Run Tolerance Analysis
-        # ZPLM macros share one POP beam file, so parallel evaluations collide and crash OpticStudio
-        if cores != 1 and any(label.startswith('ZPLM') for label in operand_labels):
-            print("[*] Merit function calls a ZPLM macro; running tolerancing on 1 core to avoid "
-                  "parallel evaluations sharing the macro's beam file.")
+        # A macro that writes a shared file (e.g. a POP beam file) collides with itself when
+        # evaluations run in parallel, so macros run on 1 core unless ParallelMacros says otherwise
+        if calls_macros and cores != 1 and not parallel_macros:
+            print("[*] Merit function calls a ZPLM macro; running tolerancing on 1 core. Set "
+                  "ParallelMacros = True in config.ini if every macro is safe to run in parallel.")
             cores = 1
         run_tolerance_analysis(system, zosapi, quick_tol_script, ztd_filename, txt_filename, cores)
 
