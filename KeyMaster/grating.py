@@ -66,6 +66,144 @@ def lattice_vectors(G, dims):
     return np.linalg.inv(G).T
 
 
+# ---------------------------------------------------------------- model-free discovery
+
+def _cross2(a, b):
+    return a[0] * b[1] - a[1] * b[0]
+
+
+def _peak2d(a, y, x):
+    """Sub-pixel vertex of a 3x3 neighbourhood (separable parabolas)."""
+    def v(l, c, r):
+        den = l - 2 * c + r
+        return 0.0 if den >= 0 else float(np.clip(0.5 * (l - r) / den, -0.5, 0.5))
+    return y + v(a[y - 1, x], a[y, x], a[y + 1, x]), x + v(a[y, x - 1], a[y, x], a[y, x + 1])
+
+
+def _reduce(b1, b2):
+    """Lagrange-Gauss reduction: shortest basis of the same 2D lattice."""
+    for _ in range(20):
+        if b2 @ b2 < b1 @ b1:
+            b1, b2 = b2, b1
+        m = np.rint((b1 @ b2) / (b1 @ b1))
+        if m == 0:
+            break
+        b2 = b2 - m * b1
+    return b1, b2
+
+
+def discover_lattice(g, w, dims, max_period_px):
+    """Repeat vectors of the image itself (px), with no assumption about the period.
+
+    Returns rows of the shortest strong repeat vectors (2 for 2D, 1 for 1D) and the normalised
+    autocorrelation at each. Raises RuntimeError when no repeat is found."""
+    H, W = g.shape
+    win = hann2d(H, W) * ndi.gaussian_filter(w.astype(np.float32), 2.0)
+    F = np.fft.fft2((g * win).astype(np.float32))
+    ac = np.real(np.fft.ifft2(F.real ** 2 + F.imag ** 2))
+    Fw = np.fft.fft2(win.astype(np.float32))
+    wa = np.real(np.fft.ifft2(Fw.real ** 2 + Fw.imag ** 2))
+    ac = np.fft.fftshift(ac / np.maximum(wa, 1e-6 * wa.max()))
+    wa = np.fft.fftshift(wa) / wa.max()
+    cy, cx = H // 2, W // 2
+    ac /= ac[cy, cx]
+    ac[wa < 0.15] = 0.0                       # too little overlap to trust
+    rmax = min(1.3 * max_period_px, 0.45 * min(H, W))
+    if dims == 1:
+        # direction from the strongest spectral peak, then the profile across the lines
+        P = np.fft.fftshift(F.real ** 2 + F.imag ** 2)
+        fy, fx = np.meshgrid(np.arange(H) - cy, np.arange(W) - cx, indexing='ij')
+        fr = np.hypot(fx / W, fy / H)
+        P[fr < 0.7 / max_period_px] = 0
+        P[fr > 0.3] = 0
+        iy, ix = np.unravel_index(np.argmax(P), P.shape)
+        n = np.array([(ix - cx) / W, (iy - cy) / H])
+        n /= np.linalg.norm(n)
+        r = np.arange(3, rmax, 0.25)
+        prof = ndi.map_coordinates(ac, [cy + r * n[1], cx + r * n[0]], order=1)
+        mx = ndi.maximum_filter1d(prof, 9)
+        cand = np.flatnonzero((prof == mx) & (prof > 0.2))
+        if len(cand) == 0:
+            raise RuntimeError("no repeat found in the image (1D)")
+        top = prof[cand].max()
+        k = cand[prof[cand] >= 0.5 * top][0]
+        if 0 < k < len(prof) - 1:
+            l, c, rr = prof[k - 1], prof[k], prof[k + 1]
+            den = l - 2 * c + rr
+            off = 0.5 * (l - rr) / den if den < 0 else 0.0
+        else:
+            off = 0.0
+        return np.array([n * (r[k] + off * 0.25)]), np.array([prof[k]])
+    mx = ndi.maximum_filter(ac, size=7)
+    yy, xx = np.nonzero((ac == mx) & (ac > 0.2))
+    d = np.hypot(xx - cx, yy - cy)
+    keep = (d > 4) & (d < rmax) & (yy > 0) & (yy < H - 1) & (xx > 0) & (xx < W - 1)
+    yy, xx, d = yy[keep], xx[keep], d[keep]
+    if len(d) < 2:
+        raise RuntimeError("no repeat found in the image")
+    val = ac[yy, xx]
+    strong = val >= 0.5 * val.max()
+    yy, xx, d, val = yy[strong], xx[strong], d[strong], val[strong]
+    order = np.argsort(d)
+    vecs = []
+    for i in order:
+        py, px = _peak2d(ac, yy[i], xx[i])
+        vecs.append(np.array([px - cx, py - cy]))
+    b1 = vecs[0]
+    b2 = next((v for v in vecs[1:]
+               if abs(_cross2(b1, v)) / (np.linalg.norm(b1) * np.linalg.norm(v)) > 0.5), None)
+    if b2 is None:
+        raise RuntimeError("only one repeat direction found; is the grating 1D?")
+    b1, b2 = _reduce(b1, b2)
+    vals = []
+    for b in (b1, b2):
+        vals.append(float(ndi.map_coordinates(ac, [[cy + b[1]], [cx + b[0]]], order=1)[0]))
+    return np.array([b1, b2]), np.array(vals)
+
+
+# true-lattice rows as integer combinations of the image repeat vectors (rows of B)
+_INTERPRETATIONS = [
+    ("full period", np.array([[1, 0], [0, 1]])),
+    ("half period on one axis", np.array([[2, 0], [0, 1]])),
+    ("half period on one axis", np.array([[1, 0], [0, 2]])),
+    ("half period on both axes", np.array([[2, 0], [0, 2]])),
+    ("centred (repeats at half the diagonal)", np.array([[1, 1], [1, -1]])),
+]
+
+
+def match_nominal(B, dims, period_along_px, period_perp_px, axis_angle):
+    """Best reading of the image repeat as the nominal lattice (or a half-period version).
+
+    Returns (label, relative error, A_true rows: along-axis vector first)."""
+    e = np.array([np.cos(axis_angle), np.sin(axis_angle)])
+    if dims == 1:
+        b = B[0]
+        best = None
+        for k, label in ((1, "full period"), (2, "half period")):
+            a = k * b
+            err = abs(np.linalg.norm(a) / period_along_px - 1)
+            if best is None or err < best[1]:
+                best = (label, err, np.array([a if a @ e >= 0 else -a]))
+        return best
+    best = None
+    for label, M in _INTERPRETATIONS:
+        A = M @ B
+        i = int(np.argmax(np.abs(A @ e)))
+        a_al, a_pe = A[i], A[1 - i]
+        if a_al @ e < 0:
+            a_al = -a_al
+        if _cross2(a_al, a_pe) < 0:
+            a_pe = -a_pe
+        err = max(abs(np.linalg.norm(a_al) / period_along_px - 1),
+                  abs(np.linalg.norm(a_pe) / period_perp_px - 1))
+        if label == "half period on one axis":
+            label = ("half period along the scale axis" if 2 in M[i]
+                     else "half period across the scale axis")
+        if best is None or err < best[1]:
+            best = (label, err, np.array([a_al, a_pe]))
+    return best
+
+
 # ---------------------------------------------------------------- spectra
 
 def zoom_dft(gw, freqs_x, freqs_y, x0=0.0, y0=0.0):
@@ -438,18 +576,38 @@ class GratingResult:
     coarse_scale: float
     flags: list = field(default_factory=list)
     offset: float = 0.0
+    discovery: dict = field(default_factory=dict)
 
 
 def measure(g, w, r0, dims, period_along_px, period_perp_px, axis_angle, max_angle_rad,
-            tmpl=None, hmax=10, scale_range=0.005):
-    """Lattice and template-origin position in one image. Builds a template if none given."""
+            tmpl=None, hmax=10, period_tol=0.03):
+    """Lattice and template-origin position in one image. Builds a template if none given.
+
+    The lattice is first found from the image alone (autocorrelation) and must match the
+    nominal period, or half of it, within period_tol; otherwise the image is rejected."""
     flags = []
-    co = coarse_lattice(g, w, dims, period_along_px, period_perp_px, axis_angle, max_angle_rad,
-                        scale_range, hmax)
-    if abs(abs(co.angle) - max_angle_rad) < 1e-9:
-        flags.append("lattice angle at the search limit")
-    if abs(abs(co.scale - 1) - scale_range) < 1e-9:
-        flags.append("lattice period at the search limit (check nominal period / um per px)")
+    B, acv = discover_lattice(g, w, dims, max(period_along_px, period_perp_px))
+    label, err, A_seed = match_nominal(B, dims, period_along_px, period_perp_px, axis_angle)
+    reps = ", ".join(f"{np.linalg.norm(b):.2f}" for b in B)
+    if err > period_tol:
+        raise RuntimeError(
+            f"the image repeats every {reps} px, which does not match the nominal period "
+            f"({period_along_px:.2f} px along the scale) or half of it within "
+            f"{period_tol * 100:.0f}% (closest: {label}, off by {err * 100:.1f}%); "
+            f"check the um/px and the grating period")
+    seed_angle = float(np.arctan2(A_seed[0][1], A_seed[0][0]))
+    alpha_seed = (seed_angle - axis_angle + np.pi) % (2 * np.pi) - np.pi
+    if abs(alpha_seed) > max_angle_rad:
+        flags.append(f"lattice at {np.degrees(alpha_seed):+.2f} deg to the scale axis "
+                     f"(more than the {np.degrees(max_angle_rad):.1f} deg expected)")
+    L_al = float(np.linalg.norm(A_seed[0]))
+    L_pe = float(np.linalg.norm(A_seed[1])) if dims == 2 else period_perp_px
+    discovery = dict(repeat_px=[float(np.linalg.norm(b)) for b in B],
+                     autocorr=[float(v) for v in acv], reading=label,
+                     mismatch_pct=float(err * 100),
+                     alpha_deg=float(np.degrees(alpha_seed)))
+    # refine around the data-derived lattice (small angle and scale ranges)
+    co = coarse_lattice(g, w, dims, L_al, L_pe, seed_angle, np.radians(0.25), 0.004, hmax)
     G, used, _ = refine_basis(g, w, co.G, dims, co.noise, hmax)
     if len(used) == 0:
         flags.append("weak grating signal: harmonic refinement skipped")
@@ -478,5 +636,5 @@ def measure(g, w, r0, dims, period_along_px, period_perp_px, axis_angle, max_ang
             fine = fine_fit(g, w, fine.G, u0[0], r0, tmpl)
     res = GratingResult(dims, fine.G, lattice_vectors(fine.G, dims), np.asarray(r0, float),
                         fine.p, fine.cov_p, ratios, corr, fine.rms, fine.amp,
-                        len(used), co.angle, co.scale, flags, fine.offset)
+                        len(used), co.angle, co.scale, flags, fine.offset, discovery)
     return res, tmpl

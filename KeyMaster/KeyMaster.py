@@ -75,6 +75,7 @@ def settings(cfg):
         orders_y=gr.get('orders_y', 'auto').strip().lower(),
         grating_cte=_f(gr, 'cte_ppm_per_c', 0.55), grating_cte_u=_f(gr, 'cte_u_ppm_per_c', 0.05),
         max_angle=np.radians(_f(gr, 'max_angle_deg', 2.0)),
+        period_tol=_f(gr, 'period_tolerance_pct', 3.0) / 100,
         centre_mm=_f(gr, 'centre_mm'),
         mpp_nom=_f(im, 'um_per_px_nominal', 1.0),
         polarity=im.get('polarity', 'auto').strip().lower(),
@@ -178,8 +179,10 @@ def process_stop(row, ctx, tmpl):
         g, w = grating.prepare(norm, ticks.chrome_mask(ink), sat)
         r0 = np.array([tr.xc, tr.y0])
         gr, tmpl = grating.measure(g, w, r0, s['dims'], p_along / mpp, p_perp / mpp, tr.theta,
-                                   s['max_angle'], tmpl, s['hmax'])
+                                   s['max_angle'], tmpl, s['hmax'], s['period_tol'])
         rec['flags'] += gr.flags
+        rec['repeat_reading'] = gr.discovery['reading']
+        rec['period_mismatch_pct'] = gr.discovery['mismatch_pct']
         # Re-read the scale with the fitted grating pattern divided out of the tick band: the
         # texture under each tick otherwise biases its centroid by a few nm.
         half = 320.0 / s['mpp_nom']
@@ -413,7 +416,7 @@ STOP_COLUMNS = ['file', 'pass', 'stop', 'direction', 'rot', 'axis', 'ok', 'used'
                 'k_last', 'assign_score', 'assign_margin', 'scale_quad_ppm_per_mm',
                 'point_x_px', 'point_y_px', 'X', 'X_lin', 'Xt', 'Y', 'd_um', 'sigma_X_um', 'n1',
                 'n2', 'count_frac', 'residual_um', 'alpha', 'period_px', 'period_local_um',
-                'fit_rms', 'saturated_frac', 'flags']
+                'fit_rms', 'repeat_reading', 'period_mismatch_pct', 'saturated_frac', 'flags']
 
 
 def write_stops(path, records):
@@ -619,7 +622,9 @@ def quick(args):
     p_pe = s['period_y'] if axis == 'x' else s['period_x']
     r0 = np.array([tr.xc, tr.y0])
     gr, _ = grating.measure(g, w, r0, s['dims'], p_al / tr.mpp, p_pe / tr.mpp, tr.theta,
-                            s['max_angle'], None, s['hmax'])
+                            s['max_angle'], None, s['hmax'], s['period_tol'])
+    print(f"  image repeats every {', '.join(f'{v:.3f}' for v in gr.discovery['repeat_px'])} px: "
+          f"read as {gr.discovery['reading']} ({gr.discovery['mismatch_pct']:+.2f}% from nominal)")
     # um/px averaged over the grating region along the axis
     ys, xs = np.nonzero(w)
     sv, _ = tr.st(xs, ys)
