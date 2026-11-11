@@ -13,6 +13,16 @@
 # If the merit function calls a ZPLM macro, OptiSense first writes the POP settings file that the
 # POP pixel-readout macro (ZPL21) reads: <lens name>_POPtext.CFG next to the lens file.
 #
+# Crosstalk (ZPLM 21 rows) runs in two stages unless CrosstalkMode = zpl:
+#   A. Tolerancing runs with the ZPLM 21 rows blanked out, on all configured cores, and saves
+#      every perturbed (and compensated) lens through SAVE rows OptiSense adds in memory.
+#   B. Python measures the ZPLM 21 rows on each saved lens (pop_crosstalk.py, same numbers as
+#      the macro, far faster), then re-saves the lens with the full merit function and its own
+#      POP settings file so it can be reopened in OpticStudio. The lenses go in
+#      <output folder>\<lens name>_TolLenses.
+# Before stage A, the nominal crosstalk is computed both ways and the run stops if the macro and
+# Python disagree.
+#
 # File paths and options are read from config.ini, located next to this script.
 
 import os
@@ -20,13 +30,19 @@ import sys
 # import time
 import math
 import re
+import glob
+import shutil
+import tempfile
 import configparser
 import traceback
+from collections import namedtuple
+from concurrent.futures import ProcessPoolExecutor
 import pandas as pd
 import numpy as np
 
 # Ensure PythonStandaloneApplication is in the same directory or Python PATH
 from PythonStandaloneApplication import PythonStandaloneApplication
+from pop_crosstalk import PixelSettings, measure_pixel_block
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 LABEL_COLUMNS = ['Operand', 'Comment', 'Min Tol', 'Max Tol']
@@ -44,6 +60,18 @@ POP_TEXT_SETTINGS_SUFFIX = '_POPtext.CFG'
 # Tolerance Data Editor rows that don't perturb the lens, so they add no merit function evaluations
 COMPENSATOR_TYPES = {'COMP', 'CPAR', 'CMCO', 'CEDV'}
 NON_TOLERANCE_TYPES = COMPENSATOR_TYPES | {'NULL', 'TOFF', 'COMM', 'SAVE', 'SEED', 'STAT', 'TWAV'}
+
+# Crosstalk macro measured in Python (pop_crosstalk.py) in two-stage runs
+CROSSTALK_MACRO = 21
+CROSSTALK_MODES = ('python', 'zpl')
+# Largest macro-vs-Python difference allowed in the nominal check (% or dB)
+CROSSTALK_CHECK_TOLERANCE = 1e-3
+# Lens files written by SAVE rows: TSAV_MIN_0001.zmx, TSAV_MAX_0001.zmx, ...
+TOL_LENS_GLOB = 'TSAV_M??_????.zmx'
+TOL_LENS_FOLDER_SUFFIX = '_TolLenses'
+
+# One ZPLM 21 row of the merit function: its row number, configuration, return slot and target
+CrosstalkRow = namedtuple('CrosstalkRow', 'index config slot target')
 
 
 def load_configuration(config_file=os.path.join(SCRIPT_DIR, "config.ini")):
@@ -63,7 +91,9 @@ def load_configuration(config_file=os.path.join(SCRIPT_DIR, "config.ini")):
             'InjectAdditionalCommands': 'False',
             'AdditionalCommandsFile': r'C:\Path\To\XtraScript.txt',
             'Cores': str(DEFAULT_CORES),
-            'ParallelMacros': 'False'
+            'ParallelMacros': 'False',
+            'CrosstalkMode': 'python',
+            'CrosstalkWorkers': '1'
         }
         with open(config_file, 'w') as f:
             config.write(f)
@@ -152,6 +182,184 @@ def write_pop_text_settings(system, zosapi, lens_file):
     return settings_path
 
 
+# ---- Two-stage crosstalk: stage A tolerancing without the macro, stage B in Python -------------
+
+def read_macro_rows(system, zosapi):
+    """
+    Returns (crosstalk_rows, other_macros) for the merit function in the editor: a CrosstalkRow
+    for each ZPLM 21 row (its configuration from the CONF row above it, its target pixel from
+    Hy and Px, as ZPL21 reads them), and the numbers of any other macros the rows call.
+
+    A ZPLM row directly below another ZPLM row with the same macro doesn't run the macro again
+    in OpticStudio: it reads another slot of the row above's call. So such a row takes the
+    target of the row above, whatever its own Hy and Px say (e.g. "ZPLM 21 10 0 0").
+    """
+    mfe = system.MFE
+    columns = zosapi.Editors.MFE.MeritColumn
+    types = zosapi.Editors.MFE.MeritOperandType
+    config, rows, other = 1, [], set()
+    previous = None    # the CrosstalkRow on the row above, if it was one
+    for k in range(1, mfe.NumberOfOperands + 1):
+        op = mfe.GetOperandAt(k)
+        row = None
+        if op.Type == types.CONF:
+            config = op.GetOperandCell(columns.Param1).IntegerValue
+        elif op.Type == types.ZPLM:
+            macro = op.GetOperandCell(columns.Param1).IntegerValue
+            if macro != CROSSTALK_MACRO:
+                other.add(macro)
+            else:
+                slot = op.GetOperandCell(columns.Param2).IntegerValue
+                if not 0 <= slot <= 10:
+                    raise ValueError(f"Merit function row {k}: ZPLM {CROSSTALK_MACRO} has no return slot {slot} (slots are 0-10)")
+                if previous is not None:
+                    target = previous.target
+                else:
+                    target = (op.GetOperandCell(columns.Param4).DoubleValue, op.GetOperandCell(columns.Param5).DoubleValue)
+                row = CrosstalkRow(k, config, slot, target)
+                rows.append(row)
+        previous = row
+    return rows, sorted(other)
+
+
+def measure_crosstalk_rows(system, zosapi, rows, pop_settings_file, pixel_settings):
+    """
+    Measures every ZPLM 21 row on the lens in the system, running POP once per configuration
+    and target. Returns {merit function row number: value}, as the macro would return it.
+    Leaves the system in the configuration it was in.
+    """
+    start_config = system.MCE.CurrentConfiguration
+    results, values = {}, {}
+    try:
+        for row in rows:
+            key = (row.config, row.target)
+            if key not in results:
+                results[key] = measure_pixel_block(system, zosapi, row.config, row.target,
+                                                   pop_settings_file, pixel_settings)
+            values[row.index] = results[key].slot(row.slot)
+    finally:
+        system.MCE.SetCurrentConfiguration(start_config)
+    if not all(r.grid_covers_block for r in results.values()):
+        print("[Warning] The POP grid does not cover the full 3x3 pixel block for this lens; "
+              "the block slots (1-9) are short, the target pixel is unaffected.")
+    return values
+
+
+def check_crosstalk_against_macro(nominal_values, python_values, operand_labels):
+    """
+    Compares the macro's nominal ZPLM 21 values with Python's. Raises if any differ by more
+    than CROSSTALK_CHECK_TOLERANCE, since the Python results would then not match the macro.
+    """
+    worst = 0.0
+    for index, value in python_values.items():
+        difference = abs(value - nominal_values[index - 1])
+        worst = max(worst, difference)
+        if difference > CROSSTALK_CHECK_TOLERANCE:
+            raise RuntimeError(
+                f"Nominal check failed: '{operand_labels[index - 1]}' is {nominal_values[index - 1]:.6f} from "
+                f"the macro but {value:.6f} from Python. Check that pop_crosstalk.py matches the macro, "
+                "or set CrosstalkMode = zpl in config.ini to run with the macro.")
+    print(f"[*] Nominal crosstalk check passed: macro and Python agree (largest difference {worst:.1e}).")
+
+
+def write_stage_a_merit_function(system, zosapi, rows, path):
+    """
+    Saves the merit function in the editor with its ZPLM 21 rows changed to BLNK, so stage A
+    never runs the macro while every other row keeps its number.
+    """
+    mfe = system.MFE
+    blank = zosapi.Editors.MFE.MeritOperandType.BLNK
+    for row in rows:
+        op = mfe.GetOperandAt(row.index)
+        op.ChangeType(blank)
+    mfe.SaveMeritFunction(path)
+
+
+def add_save_rows(system, zosapi):
+    """
+    Replaces any SAVE rows in the Tolerance Data Editor (in memory only) with one after every
+    tolerance, numbered 1, 2, ... in order, so tolerance k's lenses are TSAV_MIN/MAX_000k.zmx.
+    Returns [(operand type, comment)] for the tolerances in order.
+    """
+    tde = system.TDE
+    tol_types = zosapi.Editors.TDE.ToleranceOperandType
+    removed = 0
+    for k in range(tde.NumberOfOperands, 0, -1):
+        if str(tde.GetOperandAt(k).Type) == 'SAVE':
+            tde.RemoveOperandAt(k)
+            removed += 1
+    if removed:
+        print(f"[*] Replaced the lens's {removed} SAVE rows (in memory only) with OptiSense's own.")
+
+    tolerances = []
+    k = 1
+    while k <= tde.NumberOfOperands:
+        op = tde.GetOperandAt(k)
+        if str(op.Type) not in NON_TOLERANCE_TYPES:
+            tolerances.append((str(op.Type), str(op.Comment)))
+            save = tde.InsertNewOperandAt(k + 1)
+            save.ChangeType(tol_types.SAVE)
+            save.GetOperandCell(zosapi.Editors.TDE.ToleranceColumn.Param1).IntegerValue = len(tolerances)
+            k += 1
+        k += 1
+    return tolerances
+
+
+def tolerance_lens_path(folder, number, limit):
+    """Path of the lens SAVE row number saves at the tolerance's 'MIN' or 'MAX' limit."""
+    return os.path.join(folder, f"TSAV_{limit}_{number:04d}.zmx")
+
+
+def measure_tolerance_lenses(system, zosapi, lens_files, rows, pop_settings_file, pixel_settings,
+                             mf_file, label=''):
+    """
+    Stage B for a list of saved lenses: measures the ZPLM 21 rows on each, then re-saves it with
+    the full merit function and a copy of the POP settings file beside it, so the macro works
+    when the lens is opened in OpticStudio. Returns {lens path: {row number: value}}.
+    """
+    results = {}
+    for n, path in enumerate(lens_files, start=1):
+        if not system.LoadFile(path, False):
+            print(f"[Warning] {label}could not open {os.path.basename(path)}; its crosstalk is left blank.")
+            continue
+        results[path] = measure_crosstalk_rows(system, zosapi, rows, pop_settings_file, pixel_settings)
+        system.MFE.LoadMeritFunction(mf_file)
+        system.Save()
+        shutil.copyfile(pop_settings_file, os.path.splitext(path)[0] + POP_TEXT_SETTINGS_SUFFIX)
+        print(f"\r[*] {label}crosstalk measured on {n}/{len(lens_files)} lenses", end='', flush=True)
+    print()
+    return results
+
+
+def _stage_b_worker(worker, lens_files, rows, pop_settings_file, pixel_settings, mf_file):
+    """Stage B in a separate process with its own OpticStudio instance."""
+    zos = PythonStandaloneApplication()
+    try:
+        return measure_tolerance_lenses(zos.TheSystem, zos.ZOSAPI, lens_files, rows, pop_settings_file,
+                                        pixel_settings, mf_file, label=f"worker {worker}: ")
+    finally:
+        zos.TheApplication.CloseApplication()
+        zos.TheApplication = None
+
+
+def run_stage_b(system, zosapi, lens_files, rows, pop_settings_file, pixel_settings, mf_file, workers):
+    """
+    Measures crosstalk on every saved lens, in this process (workers = 1) or split across that
+    many OpticStudio instances, each in its own process. Returns {lens path: {row: value}}.
+    """
+    if workers <= 1:
+        return measure_tolerance_lenses(system, zosapi, lens_files, rows, pop_settings_file,
+                                        pixel_settings, mf_file)
+    chunks = [lens_files[w::workers] for w in range(workers)]
+    results = {}
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_stage_b_worker, w + 1, chunk, rows, pop_settings_file, pixel_settings, mf_file)
+                   for w, chunk in enumerate(chunks) if chunk]
+        for future in futures:
+            results.update(future.result())
+    return results
+
+
 # Time reporting disabled.
 # def _format_duration(seconds):
 #     """
@@ -231,9 +439,10 @@ def _set_tolerancing_cores(tol, cores):
               f"using its setting ({tol.SetupCore}).")
 
 
-def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filename, cores=None):
+def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filename, cores=None, progress=None):
     """
     Configures and executes the tolerance analysis using the generated script.
+    progress: optional function returning a one-line status, printed about once a second.
     """
     tol = system.Tools.OpenTolerancing()
     if tol is None:
@@ -283,6 +492,10 @@ def run_tolerance_analysis(system, zosapi, tol_script, ztd_filename, txt_filenam
         try:
             while tol.IsRunning:
                 tol.WaitWithTimeout(CANCEL_CHECK_S)
+                if progress is not None:
+                    print(f"\r{progress()}", end="", flush=True)
+            if progress is not None:
+                print()
         except KeyboardInterrupt:
             print("\n[*] Cancelling the tolerance analysis...")
             tol.Cancel()
@@ -302,13 +515,11 @@ def _evaluation_failed(value, is_macro):
     return not math.isfinite(value) or (is_macro and value in MACRO_FAILURE_VALUES)
 
 
-def _larger_change(effect, nominal, is_macro):
+def _larger_change(value_min, value_max, nominal, is_macro):
     """
     Returns the change from nominal at the tolerance's minimum or maximum, whichever is
-    larger in magnitude, keeping its sign. EstimatedChangeMinimum/Maximum hold the
-    criterion's value at each tolerance limit. Returns NaN if either evaluation failed.
+    larger in magnitude, keeping its sign. Returns NaN if either evaluation failed.
     """
-    value_min, value_max = effect.EstimatedChangeMinimum, effect.EstimatedChangeMaximum
     if _evaluation_failed(value_min, is_macro) or _evaluation_failed(value_max, is_macro):
         return math.nan
     change_min = value_min - nominal
@@ -325,44 +536,77 @@ def _format_cell(value, failed_text=''):
     return value
 
 
-def process_and_export_results(system, ztd_filepath, nom_mf_results, header_names, output_csv_path):
+def read_sensitivity_data(system, ztd_filepath, num_operands):
     """
-    Opens the ZTD file, extracts sensitivity data, computes Zeiss math, and exports to CSV.
+    Opens the ZTD file and returns one dict per tolerance, in Tolerance Data Editor order:
+    type, comment, minimum, maximum, and at_min / at_max, the value of every merit function
+    operand at each tolerance limit (EstimatedChangeMinimum/Maximum hold those values).
     """
     tol_data_viewer = system.Tools.OpenToleranceDataViewer()
     if tol_data_viewer is None:
         raise RuntimeError("Could not open the Tolerance Data Viewer. Is another analysis tool already open?")
 
-    tol_data_viewer.FileName = ztd_filepath
-    tol_data_viewer.RunAndWaitForCompletion()
-    if not tol_data_viewer.Succeeded:
-        error_message = tol_data_viewer.ErrorMessage
-        tol_data_viewer.Close()
-        raise RuntimeError(f"Could not read tolerance data file {ztd_filepath}: {error_message}")
-    sdata = tol_data_viewer.SensitivityData
+    try:
+        tol_data_viewer.FileName = ztd_filepath
+        tol_data_viewer.RunAndWaitForCompletion()
+        if not tol_data_viewer.Succeeded:
+            raise RuntimeError(f"Could not read tolerance data file {ztd_filepath}: {tol_data_viewer.ErrorMessage}")
+        sdata = tol_data_viewer.SensitivityData
 
-    # Criterion 0 is skipped; criteria 1..N correspond to the REPORT_NB lines (MFE operands 1..N)
+        # Criterion 0 is skipped; criteria 1..N correspond to the REPORT_NB lines (MFE operands 1..N)
+        if sdata.NumberOfCriteria - 1 != num_operands:
+            raise ValueError(
+                f"Tolerance data has {sdata.NumberOfCriteria - 1} report criteria, "
+                f"but the merit function has {num_operands} operands."
+            )
+
+        tolerances = []
+        for m in range(sdata.NumberOfResultOperands):
+            sd_op = sdata.GetOperand(m)
+            effects = [sd_op.GetEffectOnCriterion(j) for j in range(1, num_operands + 1)]
+            tolerances.append({
+                'type': str(sd_op.OperandType), 'comment': str(sd_op.Comment),
+                'minimum': sd_op.Minimum, 'maximum': sd_op.Maximum,
+                'at_min': [e.EstimatedChangeMinimum for e in effects],
+                'at_max': [e.EstimatedChangeMaximum for e in effects],
+            })
+    finally:
+        tol_data_viewer.Close()
+    return tolerances
+
+
+def merge_stage_b(tolerances, expected, rows, stage_b, lens_folder):
+    """
+    Puts stage B's ZPLM 21 values into each tolerance's at_min / at_max, from the lenses its
+    SAVE row wrote. expected is [(type, comment)] from add_save_rows, checked against the
+    tolerance data so a lens can never be matched to the wrong tolerance. A missing lens
+    leaves NaN (reported as a failed evaluation).
+    """
+    found = [(t['type'], t['comment']) for t in tolerances]
+    if found != expected:
+        raise RuntimeError("The tolerance data does not list the tolerances in the order OptiSense saved "
+                           "their lenses, so stage B results can't be matched to them.")
+    by_path = {os.path.normcase(path): values for path, values in stage_b.items()}
+    for number, tol in enumerate(tolerances, start=1):
+        for limit, key in (('MIN', 'at_min'), ('MAX', 'at_max')):
+            values = by_path.get(os.path.normcase(tolerance_lens_path(lens_folder, number, limit)))
+            for row in rows:
+                tol[key][row.index - 1] = values[row.index] if values else math.nan
+
+
+def export_results(tolerances, nom_mf_results, header_names, output_csv_path):
+    """
+    Computes each tolerance's change in every operand, the Zeiss summaries, and exports to CSV.
+    """
     num_operands = len(nom_mf_results)
-    if sdata.NumberOfCriteria - 1 != num_operands:
-        tol_data_viewer.Close()
-        raise ValueError(
-            f"Tolerance data has {sdata.NumberOfCriteria - 1} report criteria, "
-            f"but the merit function has {num_operands} operands."
-        )
-
     operand_labels = header_names[len(LABEL_COLUMNS):]
     is_macro = [label.startswith('ZPLM') for label in operand_labels]
 
     tol_rows = []
-    for m in range(sdata.NumberOfResultOperands):
-        sd_op = sdata.GetOperand(m)
-        effects = [
-            _larger_change(sd_op.GetEffectOnCriterion(j), nom_mf_results[j - 1], is_macro[j - 1])
-            for j in range(1, num_operands + 1)
-        ]
-        tol_rows.append([str(sd_op.OperandType), str(sd_op.Comment), sd_op.Minimum, sd_op.Maximum] + effects)
-
-    tol_data_viewer.Close()
+    for tol in tolerances:
+        effects = [_larger_change(tol['at_min'][j], tol['at_max'][j], nom_mf_results[j], is_macro[j])
+                   for j in range(num_operands)]
+        tol_rows.append([tol['type'], tol['comment'], tol['minimum'], tol['maximum']] + effects)
 
     # Summary Calculations: Abs sum, RSS, Raentsch sum, skipping failed evaluations (NaN)
     effects_array = np.array([row[len(LABEL_COLUMNS):] for row in tol_rows], dtype=float).reshape(-1, num_operands)
@@ -417,6 +661,17 @@ def main():
     cores = int(cores_text) if cores_text else None
     # Only safe with a macro that never shares a file between evaluations (ZPL21 as of 2026-10-30)
     parallel_macros = config.getboolean('SETTINGS', 'ParallelMacros', fallback=False)
+    # python: two-stage run with ZPLM 21 measured in Python; zpl: the macro runs inside tolerancing
+    crosstalk_mode = config.get('SETTINGS', 'CrosstalkMode', fallback='python').strip().lower()
+    if crosstalk_mode not in CROSSTALK_MODES:
+        print(f"[Error] CrosstalkMode in config.ini must be one of {', '.join(CROSSTALK_MODES)}, not '{crosstalk_mode}'")
+        return 1
+    # OpticStudio instances measuring crosstalk in stage B (each needs a licence seat)
+    workers_text = config.get('SETTINGS', 'CrosstalkWorkers', fallback='1').strip()
+    if not workers_text.isdigit() or int(workers_text) < 1:
+        print(f"[Error] CrosstalkWorkers in config.ini must be a whole number of at least 1, not '{workers_text}'")
+        return 1
+    workers = int(workers_text)
 
     # Validate input files before launching Zemax
     required_files = [('Zemax file', zemax_file), ('Merit function file', mf_file)]
@@ -436,9 +691,13 @@ def main():
     ztd_filepath = os.path.join(os.path.dirname(zemax_file), ztd_filename)
     txt_filepath = os.path.join(os.path.dirname(zemax_file), txt_filename)
     output_csv_path = os.path.join(output_dir, f"{filename_prefix}_TolResults.csv")
+    lens_dir = os.path.dirname(zemax_file)
+    tol_lens_dir = os.path.join(output_dir, filename_prefix + TOL_LENS_FOLDER_SUFFIX)
+    stage_a_mf = os.path.join(tempfile.gettempdir(), f"OptiSense_StageA_{os.getpid()}.MF")
 
     exit_code = 0
     zos = None
+    owns_lens_dir_tsavs = False
     try:
         # Remove results from any previous run so stale data can never be read back in
         for old_file in (ztd_filepath, txt_filepath, output_csv_path):
@@ -455,9 +714,10 @@ def main():
 
         # The pixel-readout macro needs its POP settings file before the merit function is evaluated
         calls_macros = merit_function_calls_macros(mf_file)
+        pop_settings_file = None
         if calls_macros:
-            settings_path = write_pop_text_settings(system, zosapi, zemax_file)
-            print(f"[*] POP settings for the macro saved to {settings_path}")
+            pop_settings_file = write_pop_text_settings(system, zosapi, zemax_file)
+            print(f"[*] POP settings for the macro saved to {pop_settings_file}")
 
         # 3. Load Merit Function and record nominal values
         print("[*] Calculating Nominal Merit Function...")
@@ -465,26 +725,82 @@ def main():
         # estimate_tolerance_time(system, eval_seconds, inject_commands)
         nom_mf_results, operand_labels = load_merit_function(system, zosapi, mf_file)
 
+        # Two-stage run when the merit function measures crosstalk with ZPLM 21 and no other macro
+        crosstalk_rows, other_macros = read_macro_rows(system, zosapi) if calls_macros else ([], [])
+        two_stage = bool(crosstalk_rows) and crosstalk_mode == 'python'
+        if two_stage and other_macros:
+            print(f"[*] The merit function also calls macro(s) {', '.join(map(str, other_macros))}, which only "
+                  "run inside tolerancing; running in a single stage with every macro (CrosstalkMode = zpl).")
+            two_stage = False
+
+        tol_merit_function = mf_file
+        if two_stage:
+            print(f"[*] Two-stage run: {len(crosstalk_rows)} ZPLM {CROSSTALK_MACRO} rows measured in Python.")
+            macro_path = os.path.join(str(zos.TheApplication.ZemaxDataDir), 'Macros', f'ZPL{CROSSTALK_MACRO}.ZPL')
+            pixel_settings = PixelSettings.from_zpl(macro_path)
+
+            # Lenses from an earlier run in the lens folder would be mistaken for this run's
+            stale = glob.glob(os.path.join(lens_dir, TOL_LENS_GLOB))
+            if stale:
+                raise RuntimeError(f"{len(stale)} TSAV_*.zmx files from an earlier run are in {lens_dir}. "
+                                   "Move or delete them first; OptiSense saves this run's lenses there "
+                                   "before moving them to the results folder.")
+            # From here on every TSAV file in the lens folder is this run's; removed on exit if left behind
+            owns_lens_dir_tsavs = True
+            os.makedirs(tol_lens_dir, exist_ok=True)
+            for old_file in glob.glob(os.path.join(tol_lens_dir, 'TSAV_*')):
+                os.remove(old_file)
+
+            # Nominal crosstalk from Python, checked against the macro's
+            python_nominal = measure_crosstalk_rows(system, zosapi, crosstalk_rows, pop_settings_file, pixel_settings)
+            check_crosstalk_against_macro(nom_mf_results, python_nominal, operand_labels)
+            for index, value in python_nominal.items():
+                nom_mf_results[index - 1] = value
+
+            write_stage_a_merit_function(system, zosapi, crosstalk_rows, stage_a_mf)
+            tol_merit_function = stage_a_mf
+            saved_tolerances = add_save_rows(system, zosapi)
+
         # 4. Create Tolerance Script
         print("[*] Generating Tolerance Script...")
         quick_tol_script, header_names = create_tol_script(
-            str(zos.TheApplication.ZemaxDataDir), mf_file, operand_labels, inject_commands, xtra_script_file
+            str(zos.TheApplication.ZemaxDataDir), tol_merit_function, operand_labels, inject_commands, xtra_script_file
         )
 
         # 5. Run Tolerance Analysis
         # A macro that writes a shared file (e.g. a POP beam file) collides with itself when
         # evaluations run in parallel, so macros run on 1 core unless ParallelMacros says otherwise
-        if calls_macros and cores != 1 and not parallel_macros:
+        if calls_macros and not two_stage and cores != 1 and not parallel_macros:
             print("[*] Merit function calls a ZPLM macro; running tolerancing on 1 core. Set "
                   "ParallelMacros = True in config.ini if every macro is safe to run in parallel.")
             cores = 1
-        run_tolerance_analysis(system, zosapi, quick_tol_script, ztd_filename, txt_filename, cores)
+        progress = None
+        if two_stage:
+            print("[*] Stage A: tolerancing without the crosstalk macro, saving every perturbed lens.")
+            expected = 2 * len(saved_tolerances)
+            progress = lambda: (f"[*] Stage A: {len(glob.glob(os.path.join(lens_dir, TOL_LENS_GLOB)))} "
+                                f"of {expected} lenses saved")
+        run_tolerance_analysis(system, zosapi, quick_tol_script, ztd_filename, txt_filename, cores, progress)
 
         # 6. Process and Export Results
         print("[*] Processing Tolerance Data Viewer results...")
-        process_and_export_results(
-            system, ztd_filepath, nom_mf_results, header_names, output_csv_path
-        )
+        tolerances = read_sensitivity_data(system, ztd_filepath, len(nom_mf_results))
+
+        if two_stage:
+            for path in glob.glob(os.path.join(lens_dir, TOL_LENS_GLOB)):
+                shutil.move(path, os.path.join(tol_lens_dir, os.path.basename(path)))
+            lens_files = sorted(glob.glob(os.path.join(tol_lens_dir, TOL_LENS_GLOB)))
+            if len(lens_files) != expected:
+                print(f"[Warning] Stage A saved {len(lens_files)} of {expected} lenses; tolerances without "
+                      "a lens are reported as failed in the crosstalk columns.")
+            print(f"[*] Stage B: measuring crosstalk on {len(lens_files)} lenses "
+                  f"({workers} OpticStudio instance{'s' if workers > 1 else ''}).")
+            stage_b = run_stage_b(system, zosapi, lens_files, crosstalk_rows, pop_settings_file,
+                                  pixel_settings, mf_file, workers)
+            merge_stage_b(tolerances, saved_tolerances, crosstalk_rows, stage_b, tol_lens_dir)
+            print(f"[*] Tolerance lenses (reopen in OpticStudio to inspect) saved to: {tol_lens_dir}")
+
+        export_results(tolerances, nom_mf_results, header_names, output_csv_path)
 
     except KeyboardInterrupt:
         print("[*] Run cancelled. No results were written.")
@@ -497,6 +813,15 @@ def main():
 
     finally:
         # 7. Safe Cleanup
+        if os.path.exists(stage_a_mf):
+            os.remove(stage_a_mf)
+        # Lenses a cancelled or failed stage A left in the lens folder would block the next run
+        if owns_lens_dir_tsavs:
+            for path in glob.glob(os.path.join(lens_dir, TOL_LENS_GLOB)):
+                try:
+                    os.remove(path)
+                except OSError as e:
+                    print(f"[Warning] Could not remove {path}: {e}")
         if zos is not None and zos.TheApplication is not None:
             try:
                 zos.TheApplication.CloseApplication()
