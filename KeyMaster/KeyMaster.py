@@ -36,7 +36,7 @@ import ticks
 import grating
 import period
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -208,6 +208,8 @@ def process_stop(row, ctx, tmpl):
             alpha = float(np.arctan2(a1 @ ep, a1 @ e))
             var_s = float(e @ gr.cov_p @ e)
             period_px = float(np.hypot(*a1))
+            rec['axes_angle_deg'] = float(np.degrees(np.arccos(
+                a1 @ a2 / (np.hypot(*a1) * np.hypot(*a2)))))
         else:
             g1 = gr.G[0]
             ge = float(g1 @ e)
@@ -568,6 +570,15 @@ def run(args):
     with open(os.path.join(out_dir, 'results.json'), 'w') as f:
         json.dump(jsonable(res), f, indent=2)
     write_stops(os.path.join(out_dir, 'stops.csv'), records)
+    per_axis = {a['axis']: dict(period_um=a['period_20C_um'], u_ppm=a['u_k1_um'] / a['period_20C_um'] * 1e6,
+                                terms={b['term']: b['u_k1_ppm'] for b in a['budget']})
+                for a in axes if 'error' not in a}
+    angles = [r['axes_angle_deg'] for r in records if r['ok'] and 'axes_angle_deg' in r]
+    write_period_file(out_dir, cfg, s, per_axis, angles, method="stepped, certified stage micrometer",
+                      traceable=cert.certified,
+                      length_reference=f"{profile.model}; certificate {cert.source}",
+                      notes=(["scale tick layout assumed, not yet checked on the part"]
+                             if profile.layout_assumed else []))
     text = summary_text(res)
     with open(os.path.join(out_dir, 'summary.txt'), 'w', encoding='utf-8') as f:
         f.write(text + "\n")
@@ -580,6 +591,198 @@ def run(args):
     print(text)
     print(f"\nOutputs: {out_dir}")
     return res, out_dir
+
+
+# ---------------------------------------------------------------- period file for ArgusEye
+
+# budget terms common to the x and y runs (same scale, same thermal model)
+SHARED_TERMS = ('scale certificate', 'certificate interpolation', 'temperature',
+                'Keyence calibration', 'lens distortion')
+
+
+def write_period_file(out_dir, cfg, s, per_axis, axes_angles, method, traceable,
+                      length_reference, notes=()):
+    """grating_period.json: the measured period per grating axis, in ArgusEye's format.
+
+    per_axis: {'x': dict(period_um, u_ppm (k=1), terms {name: u_ppm})}, 'y' optional."""
+    gr = cfg['grating']
+
+    def ax(a):
+        v = per_axis.get(a)
+        if not v:
+            return None, None, None
+        return float(v['period_um']), float(v['u_ppm']), float(2 * v['u_ppm'])
+
+    px, upx, Upx = ax('x')
+    py, upy, Upy = ax('y')
+    rho = None
+    if px is not None and py is not None:
+        tx, ty = per_axis['x']['terms'], per_axis['y']['terms']
+        shared = sum(tx[k] * ty[k] for k in tx if k in ty and k.startswith(SHARED_TERMS))
+        rho = float(np.clip(shared / (upx * upy), -1, 1))
+    if axes_angles:
+        ang = float(np.mean(axes_angles))
+        u_ang = float(np.hypot(np.std(axes_angles, ddof=1) / np.sqrt(len(axes_angles))
+                               if len(axes_angles) > 1 else 0.0, 0.02))
+    else:
+        ang, u_ang = 90.0, None
+    data = {
+        "grating": gr.get('name', '').strip(),
+        "period_x_um": px, "u_period_x_ppm": upx, "U_period_x_ppm": Upx,
+        "period_y_um": py, "u_period_y_ppm": upy, "U_period_y_ppm": Upy,
+        "y_measured": py is not None,
+        "correlation_xy": rho,
+        "axes_angle_deg": ang, "u_axes_angle_deg": u_ang,
+        "axis_definition": gr.get('axis_definition', '').strip(),
+        "reference_temp_c": float(s['T_ref']),
+        "cte_ppm_per_c": float(s['grating_cte']),
+        "traceable": bool(traceable),
+        "length_reference": length_reference,
+        "method": method,
+        "measured": {"date": datetime.now().isoformat(timespec='seconds'),
+                     "run_folder": os.path.abspath(out_dir), "keymaster_version": VERSION},
+        "notes": list(notes),
+    }
+    path = os.path.join(out_dir, 'grating_period.json')
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    return path, data
+
+
+# ---------------------------------------------------------------- Keyence-calibration mode
+
+def keyence_mode(args):
+    """Period from the Keyence's own calibration (no micrometer). NOT traceable.
+
+    Every image is analysed on its own: the lattice period in pixels times the um/px that the
+    VHX stored in the TIFF (or [keyence] um_per_px). The images should be at the same lens
+    and zoom and taken after the latest calibration."""
+    import glob
+    import keyence
+    cfg_path = args.config or os.path.join(SCRIPT_DIR, 'config.ini')
+    cfg = load_configuration(cfg_path)
+    base = os.path.dirname(os.path.abspath(cfg_path))
+    s = settings(cfg)
+    kc = cfg['keyence'] if cfg.has_section('keyence') else {}
+    cal_u = float(kc.get('calibration_u_ppm', '5000') or 5000)
+    dist_u = float(kc.get('distortion_u_ppm', '100') or 100)
+    factor = float(kc.get('tag17_factor', '') or keyence.TAG17_FACTOR)
+    mpp_override = float(kc['um_per_px']) if kc.get('um_per_px', '').strip() else None
+    files = []
+    for pat in args.keyence:
+        hits = sorted(glob.glob(pat))
+        files += hits if hits else [pat]
+    rot = args.rot % 360
+    axis = 'x' if rot % 180 == 0 else 'y'
+    p_al = s['period_x'] if axis == 'x' else s['period_y']
+    p_pe = s['period_y'] if axis == 'x' else s['period_x']
+    T = args.temp
+    out_root = _resolve(args.out or cfg['paths'].get('output_dir', 'output'), base)
+    out_dir = os.path.join(out_root, datetime.now().strftime('%Y%m%d_%H%M%S') + '_keyence')
+    os.makedirs(out_dir, exist_ok=True)
+    print(f"KeyMaster {VERSION} KEYENCE-CALIBRATION mode (not traceable): {len(files)} images, "
+          f"grating {axis} axis")
+    recs = []
+    for f in files:
+        rec = dict(file=os.path.basename(f), ok=False, flags=[])
+        try:
+            meta = keyence.read_meta(f, factor)
+            if mpp_override:
+                mpp = mpp_override
+                rec['flags'].append("um/px from config, not from the file")
+            elif meta:
+                mpp = meta['um_per_px']
+            else:
+                raise RuntimeError("no Keyence calibration in the file; set [keyence] um_per_px")
+            rec.update(meta or {})
+            img, full = load_image(f)
+            sat = img >= (s['saturation'] or (0.98 * full if full else np.inf))
+            rec['saturated_frac'] = float(sat.mean())
+            norm, ink, pol = ticks.normalise(img, 'dark' if s['polarity'] == 'auto'
+                                             else s['polarity'])
+            from scipy import ndimage as ndi
+            dirt = ndi.binary_dilation(ndi.binary_opening(ink > 0.6, iterations=2), iterations=6)
+            g, w = grating.prepare(norm, dirt, sat)
+            H, W = img.shape
+            r0 = np.array([(W - 1) / 2, (H - 1) / 2])
+            gr, _ = grating.measure(g, w, r0, s['dims'], p_al / mpp, p_pe / mpp, 0.0,
+                                    s['max_angle'], None, s['hmax'], s['period_tol'])
+            rec['flags'] += gr.flags
+            if s['dims'] == 2:
+                a1, a2 = gr.A
+                L_px, L2_px = float(np.hypot(*a1)), float(np.hypot(*a2))
+                rec['axes_angle_deg'] = float(np.degrees(np.arccos(a1 @ a2 / (L_px * L2_px))))
+                rec['alpha_deg'] = float(np.degrees(np.arctan2(a1[1], a1[0])))
+                rec['period_other_axis_um'] = L2_px * mpp
+            else:
+                L_px = float(1 / np.hypot(*gr.G[0]))
+                rec['alpha_deg'] = float(np.degrees(np.arctan2(gr.G[0][1], gr.G[0][0])))
+            LT = L_px * mpp
+            rec.update(ok=True, um_per_px_used=mpp, period_px=L_px, period_T_um=LT,
+                       period_20C_um=LT / (1 + s['grating_cte'] * 1e-6 *
+                                           ((T if T is not None else s['T_ref']) - s['T_ref'])),
+                       repeat_reading=gr.discovery['reading'],
+                       period_mismatch_pct=gr.discovery['mismatch_pct'], fit_rms=gr.fine_rms)
+            print(f"  {rec['file']}: zoom {rec.get('zoom')}, {mpp:.6f} um/px, period "
+                  f"{L_px:.3f} px = {rec['period_20C_um']:.4f} um ({gr.discovery['reading']})")
+        except Exception as ex:
+            rec['flags'].append(f"FAILED: {ex}")
+            print(f"  {rec['file']}: {rec['flags'][-1]}")
+        recs.append(rec)
+    ok = [r for r in recs if r['ok']]
+    if not ok:
+        sys.exit("[!] no image could be measured")
+    # combine: mean per zoom, then the mean of the zoom means
+    zooms = {}
+    for r in ok:
+        zooms.setdefault(r.get('zoom'), []).append(r['period_20C_um'])
+    zmeans = {z: float(np.mean(v)) for z, v in zooms.items()}
+    L = float(np.mean(list(zmeans.values())))
+    # image-to-image scatter within each zoom (zoom differences have their own term)
+    dev = np.concatenate([np.array(v) - np.mean(v) for v in zooms.values()])
+    dof = len(dev) - len(zooms)
+    terms = {}
+    terms['Keyence calibration'] = cal_u
+    terms['statistical (image to image)'] = (float(np.sqrt(np.sum(dev ** 2) / dof)
+                                                   / np.sqrt(len(dev)) / L * 1e6) if dof > 0 else 0.0)
+    if dof <= 0:
+        notes_stat = "only one image per zoom: image-to-image scatter not measured"
+    else:
+        notes_stat = None
+    if len(zmeans) > 1:
+        zr = max(zmeans.values()) - min(zmeans.values())
+        terms['zoom-to-zoom disagreement'] = zr / 2 / L * 1e6 / np.sqrt(3)
+    terms['lens distortion (in-image average)'] = dist_u
+    terms['temperature'] = s['grating_cte'] * (s['temp_u'] if T is not None else 2.0)
+    uc = float(np.sqrt(sum(v ** 2 for v in terms.values())))
+    notes = ["Keyence calibration only; replace with a stepped micrometer measurement",
+             f"um/px = Keyence entry 17 / {factor} (measured at x100 on 2026-11-09)"]
+    if T is None:
+        notes.append("temperature not given; 20 +/- 2 C assumed")
+    if notes_stat:
+        notes.append(notes_stat)
+    angles = [r['axes_angle_deg'] for r in ok if 'axes_angle_deg' in r]
+    model = next((r.get('model') for r in ok if r.get('model')), 'VHX')
+    path, data = write_period_file(
+        out_dir, cfg, s, {axis: dict(period_um=L, u_ppm=uc, terms=terms)}, angles,
+        method="Keyence calibration, single images (no micrometer)", traceable=False,
+        length_reference=f"Keyence {model} calibration (OP-88592 scale)", notes=notes)
+    res = dict(version=VERSION, mode='keyence', axis=axis, period_20C_um=L, u_k1_ppm=uc,
+               U_k2_ppm=2 * uc, budget_k1_ppm=terms, per_zoom=zmeans, images=recs,
+               input_sha256={os.path.basename(f): file_hash(f) for f in files
+                             if os.path.exists(f)})
+    with open(os.path.join(out_dir, 'results.json'), 'w') as f:
+        json.dump(jsonable(res), f, indent=2)
+    print(f"\n  Period ({axis} axis) at {s['T_ref']:.0f} C: {L:.4f} um +/- {2 * uc * L * 1e-6:.4f} um "
+          f"(k=2) = {2 * uc:.0f} ppm   [Keyence calibration, NOT traceable]")
+    for z, m in sorted(zmeans.items(), key=lambda v: (v[0] is None, v[0])):
+        print(f"    zoom {z}: {m:.4f} um ({len(zooms[z])} images)")
+    for k, v in terms.items():
+        print(f"    {k}: {2 * v:.0f} ppm (k=2)")
+    if angles:
+        print(f"  Angle between the lattice axes: {data['axes_angle_deg']:.4f} deg")
+    print(f"\n  Period file: {path}")
+    return data
 
 
 # ---------------------------------------------------------------- quick mode
@@ -675,10 +878,16 @@ def main(argv=None):
     ap.add_argument('--workers', type=int, help="parallel processes for image analysis")
     ap.add_argument('--quick', nargs='+', metavar='IMAGE',
                     help="quick mode: SCALE_IMAGE [GRATING_IMAGE]")
+    ap.add_argument('--keyence', nargs='+', metavar='IMAGE',
+                    help="Keyence-calibration mode (no micrometer, not traceable): IMAGES or "
+                         "wildcards; um/px is read from each VHX TIFF")
     ap.add_argument('--scale-mm', type=float, help="quick mode: approximate scale reading (mm)")
-    ap.add_argument('--rot', type=int, default=0, help="quick mode: grating rotation (deg)")
-    ap.add_argument('--temp', type=float, help="quick mode: temperature (C)")
+    ap.add_argument('--rot', type=int, default=0,
+                    help="quick/Keyence mode: grating rotation (deg); 0/180 = grating x axis")
+    ap.add_argument('--temp', type=float, help="quick/Keyence mode: grating temperature (C)")
     args = ap.parse_args(argv)
+    if args.keyence:
+        return keyence_mode(args)
     if args.quick:
         return quick(args)
     return run(args)
