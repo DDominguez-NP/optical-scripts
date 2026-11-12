@@ -3,23 +3,30 @@
 # A diffraction order (m, n) leaves the grating with direction cosines
 #     (alpha, beta) = (alpha0, beta0) + m * g1 + n * g2,   |g1| = lambda / period_x,  |g2| = lambda / period_y
 # which are exactly linear in the orders; (alpha0, beta0) is the zero-order direction (grating tilt).
-# The Fourier lens and camera map a direction to the sensor at
-#     pixel = c + F * D(t),   t = (alpha, beta) / gamma,   gamma = sqrt(1 - alpha^2 - beta^2)
-# i.e. an ideal f*tan(theta) lens (F = f / pixel pitch) plus a 2D polynomial distortion
-#     D(t) = t + sum over 2 <= i + j <= degree of  a_ij * tx^i * ty^j
-# The polynomial has no linear terms, so the x and y scales stay tied together by the single F
-# and the reference's known period calibrates both axes. A polynomial (rather than a radial term)
-# also covers a beam that passes the lens off-centre or a tilted sensor.
 #
-# Reference fit: g1, g2 known (period from config), orthogonal, rotated by phi; alpha0 = beta0 = 0,
-#                which defines c. Fit F, c, phi and the distortion coefficients.
-# Sample fit:    camera fixed from the reference. Fit (alpha0, beta0) and the free vectors g1, g2
-#                (which absorb rotation and any non-orthogonality). |g| gives the sample period.
+# Camera: pinhole (f*tan(theta)) with Brown-Conrady distortion, in the OpenCV convention:
+#     t = (alpha, beta) / gamma,  gamma = sqrt(1 - alpha^2 - beta^2)    normalised image coordinates
+#     r^2 = tx^2 + ty^2
+#     xd = tx (1 + k1 r^2 + k2 r^4 + k3 r^6) + 2 p1 tx ty + p2 (r^2 + 2 tx^2)
+#     yd = ty (1 + k1 r^2 + k2 r^4 + k3 r^6) + p1 (r^2 + 2 ty^2) + 2 p2 tx ty
+#     pixel = principal point + F * (xd, yd)                              (fx = fy = F, no skew)
+# Directions in t are measured from the lens axis. The fit finds where the reference's zero order
+# lies relative to that axis (the axis offset), which also places the centre of the distortion.
+# Which terms are fitted is set in config.ini (distortion = k1, k1 p1 p2, ...). Over the few degrees
+# a Fourier lens covers, the higher radial terms (k2, k3) are poorly determined and extrapolate
+# badly beyond the reference spots, so k1 is the default.
+#
+# Reference fit: g1, g2 known (period from config), orthogonal, rotated by phi. Fit F, the principal
+#                point, phi, the axis offset and the distortion coefficients.
+# Sample fit:    camera fixed from the reference. Fit (alpha0, beta0) relative to the reference's zero
+#                order and the free vectors g1, g2 (which absorb rotation and any non-orthogonality).
+#                |g| gives the sample period.
 #
 # The wavelength used here cancels: F calibrated with lambda scales with lambda, and the sample's
 # |g| is measured on that same scale, so the sample period comes out in units of the reference
 # period and the reported angles are those at the report wavelength.
 
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -27,24 +34,53 @@ from scipy.optimize import least_squares
 
 from spots import outer_order
 
-T_SCALE = 0.04                 # typical |t|; keeps the polynomial coefficients near unity
+T_SCALE = 0.04                 # typical |t|; coefficients are fitted in units scaled by this
 FD_REL_STEP = 1e-6
 CENTROID_FLOOR_PX = 0.005      # minimum per-spot position error used for weighting
+ADEQUATE_RMS_RATIO = 1.5       # an alternative model fitting worse than this (x the main rms) is not counted
 
 
-def distortion_terms(degree):
-    return [(i, d - i) for d in range(2, degree + 1) for i in range(d + 1)]
+@dataclass(frozen=True)
+class DistortionModel:
+    """Which Brown-Conrady terms are fitted: radial k1..k<n_k>, and p1, p2 if tangential."""
+    n_k: int = 1
+    tangential: bool = False
+
+    @classmethod
+    def parse(cls, text):
+        names = text.replace(',', ' ').lower().split()
+        ks = sorted(int(n[1]) for n in names if re.fullmatch(r'k[1-3]', n))
+        ps = sorted(n for n in names if re.fullmatch(r'p[12]', n))
+        if (len(ks) + len(ps) != len(names) or not ks or ks != list(range(1, len(ks) + 1))
+                or ps not in ([], ['p1', 'p2'])):
+            raise ValueError(f"distortion = '{text}': use the radial terms k1 (k2, k3) in order, "
+                             "optionally with p1 p2; e.g. 'k1' or 'k1 p1 p2'")
+        return cls(len(ks), bool(ps))
+
+    @property
+    def name(self):
+        return ' '.join([f'k{i}' for i in range(1, self.n_k + 1)] + (['p1', 'p2'] if self.tangential else []))
+
+    @property
+    def n_coef(self):
+        return self.n_k + (2 if self.tangential else 0)
+
+    def alternative(self):
+        """The model compared against for the distortion-model uncertainty: tangential terms toggled."""
+        return DistortionModel(self.n_k, not self.tangential)
 
 
-def project(dc, F, c, coef, terms):
-    """Direction cosines (N, 2) to pixel positions (N, 2)."""
-    gamma = np.sqrt(1 - (dc ** 2).sum(axis=1, keepdims=True))
-    t = dc / gamma
+def project(dc, F, pp, axis, k, p):
+    """Direction cosines (N, 2), relative to the reference zero order, to pixel positions (N, 2)."""
+    d = axis + dc
+    t = d / np.sqrt(1 - (d ** 2).sum(axis=1, keepdims=True))
     u = t / T_SCALE
-    d = t.copy()
-    for a, (i, j) in zip(coef, terms):
-        d += np.outer(u[:, 0] ** i * u[:, 1] ** j * T_SCALE, a)
-    return c + F * d
+    x, y = u[:, 0], u[:, 1]
+    r2 = x * x + y * y
+    radial = 1 + sum(ki * r2 ** (i + 1) for i, ki in enumerate(k))
+    xd = x * radial + 2 * p[0] * x * y + p[1] * (r2 + 2 * x * x)
+    yd = y * radial + p[0] * (r2 + 2 * y * y) + 2 * p[1] * x * y
+    return pp + F * T_SCALE * np.c_[xd, yd]
 
 
 def _rot(phi):
@@ -70,27 +106,46 @@ def _spot_arrays(spots):
 @dataclass
 class Camera:
     F: float                   # focal length in pixels
-    c: np.ndarray              # pixel position of direction (0, 0)
-    coef: np.ndarray           # (n_terms, 2) distortion coefficients
-    terms: list
+    pp: np.ndarray             # principal point (lens axis on the sensor), px
+    axis: np.ndarray           # reference zero-order direction relative to the lens axis (dir. cosines)
+    k: np.ndarray              # radial coefficients, in fitted (T_SCALE) units
+    p: np.ndarray              # tangential p1, p2, in fitted units; zeros when not fitted
+    model: DistortionModel
 
     def project(self, dc):
-        return project(dc, self.F, self.c, self.coef, self.terms)
+        return project(dc, self.F, self.pp, self.axis, self.k, self.p)
+
+    @property
+    def c(self):
+        """Pixel position of the reference zero-order direction."""
+        return self.project(np.zeros((1, 2)))[0]
+
+    @property
+    def k_opencv(self):
+        return self.k / T_SCALE ** (2 * np.arange(1, len(self.k) + 1))
+
+    @property
+    def p_opencv(self):
+        return self.p / T_SCALE
 
 
 @dataclass
 class ReferenceFit:
     camera: Camera
     phi: float                 # grating rotation on the sensor, rad
-    degree: int
-    params: np.ndarray         # (F, cx, cy, phi, coefficients...)
+    params: np.ndarray         # (F, ppx, ppy, phi, axis_a, axis_b, k..., p1, p2)
     cov: np.ndarray
     residuals: np.ndarray      # (N, 2) model - measured, px
     chi2_red: float
     g1: np.ndarray
     g2: np.ndarray
     loo_rms: float = np.nan    # leave-one-out prediction rms, px
+    extrapolation_rms: float = np.nan  # outer ring predicted from a fit to the spots inside it, px
     t_extent: np.ndarray = None  # max |tx|, |ty| covered by the reference spots
+
+    @property
+    def model(self):
+        return self.camera.model
 
     @property
     def F(self):
@@ -105,48 +160,68 @@ class ReferenceFit:
         return float(np.sqrt(self.cov[0, 0]))
 
 
-def _camera_from_params(p, terms):
-    return Camera(F=p[0], c=np.asarray(p[1:3]), coef=np.asarray(p[4:]).reshape(-1, 2), terms=terms)
+def _camera_from_params(p, model):
+    i = 6 + model.n_k
+    tang = np.asarray(p[i:i + 2]) if model.tangential else np.zeros(2)
+    return Camera(F=p[0], pp=np.asarray(p[1:3]), axis=np.asarray(p[4:6]), k=np.asarray(p[6:i]),
+                  p=tang, model=model)
 
 
-def _reference_model(orders, steps, terms):
-    def model(p):
+def _reference_model(orders, steps, model):
+    def fun(p):
         dc = (orders * steps) @ _rot(p[3]).T
-        return _camera_from_params(p, terms).project(dc)
-    return model
+        return _camera_from_params(p, model).project(dc)
+    return fun
 
 
-def fit_reference(pattern, sin_x, sin_y, F0, degree=3, leave_one_out=True):
+def _fit_reference_spots(orders, pos, sig, steps, model, p0):
+    fun = _reference_model(orders, steps, model)
+    return _weighted_fit(lambda q: fun(q) - pos, p0, sig)
+
+
+def fit_reference(pattern, sin_x, sin_y, F0, model=DistortionModel(), leave_one_out=True):
     """
     Calibrates the camera from the reference pattern. sin_x, sin_y are lambda/period of the
-    reference along its two axes (direction-cosine step per order).
+    reference along its two axes (direction-cosine step per order). With leave_one_out, also runs
+    the leave-one-out and extrapolation checks.
     """
     orders, pos, sig = _spot_arrays(pattern.used)
     steps = np.array([sin_x, sin_y])
-    terms = distortion_terms(degree)
-    if orders.shape[0] * 2 <= 4 + 2 * len(terms):
-        raise RuntimeError(f"Not enough reference spots for distortion degree {degree}")
-    model = _reference_model(orders, steps, terms)
-    p0 = np.r_[F0, pattern.center, np.arctan2(pattern.a1[1], pattern.a1[0]), np.zeros(2 * len(terms))]
-    p, cov, chi2 = _weighted_fit(lambda q: model(q) - pos, p0, sig)
+    n_par = 6 + model.n_coef
+    if orders.shape[0] * 2 <= n_par:
+        raise RuntimeError(f"Not enough reference spots for distortion model {model.name}")
+    p0 = np.r_[F0, pattern.center, np.arctan2(pattern.a1[1], pattern.a1[0]), 0.0, 0.0, 0.0]
+    base = DistortionModel(1, False)
+    if model != base:
+        # Larger models start from the converged k1 fit; from a cold start they can step off the sphere
+        p_base, _, _ = _fit_reference_spots(orders, pos, sig, steps, base, p0)
+        p0 = np.r_[p_base, np.zeros(model.n_coef - 1)]
+    p, cov, chi2 = _fit_reference_spots(orders, pos, sig, steps, model, p0)
 
-    loo = np.nan
+    loo = extrap = np.nan
     if leave_one_out:
         errs = []
-        for k in range(len(orders)):
-            keep = np.arange(len(orders)) != k
-            mk = _reference_model(orders[keep], steps, terms)
-            pk, _, _ = _weighted_fit(lambda q: mk(q) - pos[keep], p, sig[keep])
-            errs.append(_reference_model(orders[k:k + 1], steps, terms)(pk)[0] - pos[k])
+        for j in range(len(orders)):
+            keep = np.arange(len(orders)) != j
+            pj, _, _ = _fit_reference_spots(orders[keep], pos[keep], sig[keep], steps, model, p)
+            errs.append(_reference_model(orders[j:j + 1], steps, model)(pj)[0] - pos[j])
         loo = float(np.sqrt((np.array(errs) ** 2).sum(axis=1).mean()))
+
+        # Extrapolation check: calibrate on the spots inside the outer ring, predict the outer ring
+        outer = ((np.abs(orders[:, 0]) == np.abs(orders[:, 0]).max())
+                 | (np.abs(orders[:, 1]) == np.abs(orders[:, 1]).max()))
+        if outer.any() and (~outer).sum() >= n_par:
+            pi, _, _ = _fit_reference_spots(orders[~outer], pos[~outer], sig[~outer], steps, model, p)
+            e = _reference_model(orders[outer], steps, model)(pi) - pos[outer]
+            extrap = float(np.sqrt((e ** 2).sum(axis=1).mean()))
 
     dc = (orders * steps) @ _rot(p[3]).T
     t = dc / np.sqrt(1 - (dc ** 2).sum(axis=1, keepdims=True))
     R = _rot(p[3])
-    return ReferenceFit(camera=_camera_from_params(p, terms), phi=p[3], degree=degree, params=p,
-                        cov=cov, residuals=model(p) - pos, chi2_red=chi2,
+    return ReferenceFit(camera=_camera_from_params(p, model), phi=p[3], params=p, cov=cov,
+                        residuals=_reference_model(orders, steps, model)(p) - pos, chi2_red=chi2,
                         g1=R @ [sin_x, 0.0], g2=R @ [0.0, sin_y], loo_rms=loo,
-                        t_extent=np.abs(t).max(axis=0))
+                        extrapolation_rms=extrap, t_extent=np.abs(t).max(axis=0))
 
 
 @dataclass
@@ -160,6 +235,7 @@ class SampleFit:
     camera: Camera
     u_g_calib: np.ndarray = field(default_factory=lambda: np.zeros(2))   # |g1|,|g2| from the camera
     n_extrapolated: int = 0    # used spots outside the field the reference calibrated
+    t_extent: np.ndarray = None  # max |tx|, |ty| reached by the sample spots
 
     @property
     def c(self):
@@ -195,10 +271,11 @@ def fit_sample(pattern, ref):
     dc = p[:2] + orders[:, :1] * p[2:4] + orders[:, 1:] * p[4:6]
     t = dc / np.sqrt(1 - (dc ** 2).sum(axis=1, keepdims=True))
     fit.n_extrapolated = int((np.abs(t) > ref.t_extent * 1.02).any(axis=1).sum())
+    fit.t_extent = np.abs(t).max(axis=0)
 
     # Propagate the reference calibration's covariance into |g1|, |g2| by finite differences
     def mags(ref_params):
-        q, *_ = _fit_lattice(orders, pos, sig, _camera_from_params(ref_params, cam.terms), p)
+        q, *_ = _fit_lattice(orders, pos, sig, _camera_from_params(ref_params, cam.model), p)
         return np.array([np.hypot(*q[2:4]), np.hypot(*q[4:6])])
     base = fit.mags
     jac = np.zeros((2, len(ref.params)))
