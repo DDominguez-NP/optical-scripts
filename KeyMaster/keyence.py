@@ -2,7 +2,8 @@
 #
 # The VHX-X1 writes a private "KmsFile" maker note into the EXIF of every TIFF. Entries used
 # here (found by comparing files, not from Keyence documentation):
-#   17    calibration value; um/px of the saved image = value / TAG17_FACTOR
+#   17    calibration value; um/px of a standard-width image = value / TAG17_FACTOR
+#   3     saved image width; 442 standard width the calibration refers to (2880)
 #   286   zoom (e.g. 100, 500)
 #   1555  stage X, 1556 stage Y, 1557 stage Z (um)
 #   2     capture time;  72  controller model (e.g. "VHX-X1")
@@ -19,15 +20,16 @@ TAG17_FACTOR = 2.37319
 
 
 def _blocks(path):
+    """(blocks, integers): data blocks by entry, and single integer entries."""
     with tifffile.TiffFile(path) as t:
         exif = t.pages[0].tags.get('ExifTag')
         if exif is None:
-            return None
+            return None, {}
         mn = exif.value.get('MakerNote') if isinstance(exif.value, dict) else None
     if not mn or not mn.startswith(b'KmsFile'):
-        return None
+        return None, {}
     n = struct.unpack_from('<H', mn, 8)[0]
-    entries = {}
+    entries, ints = {}, {}
     with open(path, 'rb') as f:
         for i in range(n):
             tag, typ, cnt = struct.unpack_from('<HHI', mn, 10 + 12 * i)
@@ -35,7 +37,10 @@ def _blocks(path):
             if typ == 7 and cnt > 8:
                 f.seek(struct.unpack('<I', raw)[0])
                 entries[tag] = f.read(cnt)
-    return entries
+            elif typ in (3, 4, 9) and cnt == 1:
+                ints[tag] = struct.unpack({3: '<H', 4: '<I', 9: '<i'}[typ],
+                                          raw[:2 if typ == 3 else 4])[0]
+    return entries, ints
 
 
 def _value(block):
@@ -57,7 +62,7 @@ def _value(block):
 def read_meta(path, factor=TAG17_FACTOR):
     """Calibration, zoom, stage position and time from a VHX TIFF, or None if absent."""
     try:
-        b = _blocks(path)
+        b, ints = _blocks(path)
     except Exception:
         return None
     if not b or 17 not in b:
@@ -66,9 +71,16 @@ def read_meta(path, factor=TAG17_FACTOR):
     if not isinstance(cal, float) or cal <= 0:
         return None
     t = _value(b.get(2))
+    # The calibration refers to the standard image width (entry 442, 2880 px). A file saved at
+    # another width (entry 3, e.g. 4000 px in 4K mode) covers the same field, so its pixels are
+    # smaller by base/width. Checked 2026-11-13 on the MS-500 at x500: 4K and standard images
+    # give the same period to 45 ppm.
+    width, base = ints.get(3), ints.get(442)
+    scale = base / width if (width and base) else 1.0
     return dict(
         calibration_value=cal,
-        um_per_px=cal / factor,
+        image_width_px=width, calibration_width_px=base, width_scale=scale,
+        um_per_px=cal / factor * scale,
         zoom=_value(b.get(286)),
         stage_x_um=_value(b.get(1555)),
         stage_y_um=_value(b.get(1556)),

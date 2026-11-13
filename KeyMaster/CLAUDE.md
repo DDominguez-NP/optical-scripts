@@ -196,4 +196,15 @@ Departures from sections 3–9 above:
 - Ticks are re-read after dividing the fitted grating pattern out of the tick band.
 - Statistical term = larger of the pooled-fit SE and the between-pass spread (not both); scale-fit model and gap-correction terms are sensitivity estimates.
 
+## 12. Status (2026-11-13): paused until the stage micrometer arrives
+
+Findings from real Keyence VHX-X1 images (no micrometer yet):
+- Odd-orders-only gratings (MS-460-2-N-A 8 × 6, MS-500 10 × 10) image as thin outlines that look the same for either step direction, so the image repeats at Λ/2 on both axes (half-shift scores 0.99–1.00). KeyMaster detects this ("half period on both axes") and reports the full Λ.
+- `keyence.py` reads the VHX maker note: µm/px = entry 17 / 2.37319 (checked to 1 ppm against the on-screen tool at ×100, before and after a recalibration); 4K images are scaled by 2880/4000 (checked to 45 ppm). Stage XYZ are entries 1555–1557.
+- Magnification changes by about +44 ppm per µm of focus height at ×500.
+- MS-460-2-N-A, Keyence calibration only: 244.24 µm ± 1% (k = 2), 0.9% above the 242.12 µm datasheet value (itself only good to about ±0.8% because 0.62° is rounded). Interim period file given to ArgusEye with `traceable: false`.
+- MS-500: Keyence ×500 gives 130.459 µm (x), 130.419 µm (y). The ratio to the MS-460 at the same zoom predicts 130.57 µm (1.1497° at 1310 nm) in ArgusEye's units; ArgusEye measured 130.14 µm (1.1535°), −0.33%. Unresolved. Candidates: Keyence zoom repeatability between sessions (test: MS-460 / MS-500 / MS-460 at ×500 without touching the zoom) and ArgusEye extrapolating its camera model beyond the MS-460 spot field (test: fit only spots inside it, vary the distortion degree).
+
+When the micrometer arrives: image it at ×100 to confirm the tick layout and fix `scales.py`/`config.ini`; load its certificate; run the stepped measurement of the MS-460-2-N-A (x, then y at 90°), then the MS-500 the same way; replace both period files with `traceable: true` versions.
+
 Open items: confirm the real tick layouts (hierarchy, line width, numbering, Edmund square outlines → `exclude_mm`) on Keyence images of each scale; load the real certificates (and check that the Edmund NIST certificate covers the axis used); confirm the soda-lime CTE; first real-data checks per §7.2–7.3.

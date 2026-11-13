@@ -761,6 +761,11 @@ def keyence_mode(args):
         notes.append("temperature not given; 20 +/- 2 C assumed")
     if notes_stat:
         notes.append(notes_stat)
+    widths = {(r.get('image_width_px'), r.get('calibration_width_px')) for r in ok
+              if abs(r.get('width_scale', 1.0) - 1) > 1e-9}
+    for w_img, w_cal in sorted(widths):
+        notes.append(f"images saved {w_img} px wide: um/px scaled by {w_cal}/{w_img} (same field "
+                     f"of view as the {w_cal} px image; checked to 45 ppm on 2026-11-13)")
     angles = [r['axes_angle_deg'] for r in ok if 'axes_angle_deg' in r]
     model = next((r.get('model') for r in ok if r.get('model')), 'VHX')
     path, data = write_period_file(
